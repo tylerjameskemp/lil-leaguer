@@ -9,7 +9,8 @@ Lil Leaguer is a game-day helper for assistant coaches managing Portland AAA Lit
 - Tracks player position requests so kids get a shot at preferred spots.
 - Checks the AAA rule that every player must play at least 3 full defensive innings.
 - Tracks pitch counts, daily pitch limits by league age, rest days, and pitcher/catcher lockouts.
-- Saves roster and pitch-count state in the browser for quick use at the field.
+- Saves roster, pitch-count state, and season fairness totals in the browser for quick use at the field.
+- Lets one coach save each completed game to carry bench and position fairness across the season.
 
 ## AAA Rules Included
 
@@ -37,4 +38,3 @@ Open `http://localhost:3000`.
 ## Deploying
 
 This is a Next.js app and is ready to import into Vercel after the GitHub repo is created.
-

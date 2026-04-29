@@ -8,24 +8,42 @@ import {
   generateAssignments,
   pitchLimitForAge,
   restDaysForPitches,
+  type Assignment,
   type Player,
+  type PlayerSeasonStats,
   type Position,
+  type SeasonStats,
 } from "@/lib/rotation";
 
 type PitchLog = Record<string, number>;
+type GameRecord = {
+  id: string;
+  date: string;
+  playerCount: number;
+  stats: SeasonStats;
+};
 
 const STORAGE_KEY = "lil-leaguer-state-v1";
 
 export default function Home() {
   const [players, setPlayers] = useState<Player[]>(() => readStoredState().players ?? DEFAULT_PLAYERS);
   const [pitchLog, setPitchLog] = useState<PitchLog>(() => readStoredState().pitchLog ?? {});
+  const [seasonStats, setSeasonStats] = useState<SeasonStats>(
+    () => readStoredState().seasonStats ?? {},
+  );
+  const [gameHistory, setGameHistory] = useState<GameRecord[]>(
+    () => readStoredState().gameHistory ?? [],
+  );
   const [activeInning, setActiveInning] = useState(1);
 
   useEffect(() => {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ players, pitchLog }));
-  }, [players, pitchLog]);
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ players, pitchLog, seasonStats, gameHistory }),
+    );
+  }, [players, pitchLog, seasonStats, gameHistory]);
 
-  const assignments = useMemo(() => generateAssignments(players), [players]);
+  const assignments = useMemo(() => generateAssignments(players, seasonStats), [players, seasonStats]);
   const innings = assignments.filter((assignment) => assignment.inning > 0);
   const compliance = assignments.find((assignment) => assignment.inning === 0)?.notes ?? [];
   const activeAssignment = innings.find((assignment) => assignment.inning === activeInning) ?? innings[0];
@@ -60,6 +78,26 @@ export default function Home() {
     ]);
   }
 
+  function saveGameToSeason() {
+    const stats = summarizeGame(players, innings, pitchLog);
+    setSeasonStats((current) => mergeSeasonStats(current, stats));
+    setGameHistory((current) => [
+      {
+        id: String(Date.now()),
+        date: new Date().toLocaleDateString(),
+        playerCount: presentCount,
+        stats,
+      },
+      ...current,
+    ]);
+    setPitchLog({});
+  }
+
+  function resetSeason() {
+    setSeasonStats({});
+    setGameHistory([]);
+  }
+
   return (
     <main className="min-h-screen bg-[#f6f4ed] text-[#17211f]">
       <section className="border-b border-[#d8d2c4] bg-[#fbfaf5]">
@@ -80,7 +118,7 @@ export default function Home() {
             <div className="grid grid-cols-3 gap-2 text-center sm:w-[430px]">
               <Metric label="Present" value={`${presentCount}/${players.length}`} />
               <Metric label="Bench/inning" value={String(Math.max(0, presentCount - 9))} />
-              <Metric label="Min field" value={`${AAA_RULES.minDefensiveInnings} inn`} />
+              <Metric label="Games saved" value={String(gameHistory.length)} />
             </div>
           </div>
         </div>
@@ -88,6 +126,45 @@ export default function Home() {
 
       <div className="mx-auto grid max-w-7xl gap-5 px-4 py-5 sm:px-6 lg:grid-cols-[340px_1fr] lg:px-8">
         <aside className="space-y-5">
+          <section className="rounded-lg border border-[#d8d2c4] bg-white p-4 shadow-sm">
+            <div>
+              <h2 className="text-lg font-semibold">Season Fairness</h2>
+              <p className="text-sm text-[#66716d]">
+                Saved games bias future rotations toward players due for field time or favorite spots.
+              </p>
+            </div>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              <button
+                className="h-10 rounded-md bg-[#176a5f] px-3 text-sm font-semibold text-white shadow-sm transition hover:bg-[#0f554c]"
+                onClick={saveGameToSeason}
+              >
+                Save game
+              </button>
+              <button
+                className="h-10 rounded-md border border-[#d8d2c4] px-3 text-sm font-semibold transition hover:border-[#9b3d2e]"
+                onClick={resetSeason}
+              >
+                Reset
+              </button>
+            </div>
+            <div className="mt-4 space-y-2">
+              {players.map((player) => {
+                const stats = seasonStats[player.id] ?? emptyStats();
+                return (
+                  <div
+                    key={player.id}
+                    className="grid grid-cols-[1fr_auto] gap-3 rounded-md border border-[#e4ded0] bg-[#fbfaf5] px-3 py-2 text-sm"
+                  >
+                    <div className="font-semibold">{player.name}</div>
+                    <div className="text-right text-[#66716d]">
+                      {stats.fieldInnings} field / {stats.benchInnings} bench
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
           <section className="rounded-lg border border-[#d8d2c4] bg-white p-4 shadow-sm">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -281,6 +358,27 @@ export default function Home() {
               </table>
             </div>
           </section>
+
+          <section className="rounded-lg border border-[#d8d2c4] bg-white p-4 shadow-sm">
+            <h2 className="text-lg font-semibold">Saved Games</h2>
+            <div className="mt-4 space-y-2">
+              {gameHistory.length ? (
+                gameHistory.slice(0, 5).map((game) => (
+                  <div
+                    key={game.id}
+                    className="rounded-md border border-[#e4ded0] bg-[#fbfaf5] px-3 py-2 text-sm"
+                  >
+                    <div className="font-semibold">{game.date}</div>
+                    <div className="text-[#66716d]">{game.playerCount} players recorded</div>
+                  </div>
+                ))
+              ) : (
+                <p className="text-sm text-[#66716d]">
+                  Save each finished game to carry fairness across the season on this phone.
+                </p>
+              )}
+            </div>
+          </section>
         </section>
       </div>
     </main>
@@ -292,10 +390,70 @@ function readStoredState() {
   const stored = window.localStorage.getItem(STORAGE_KEY);
   if (!stored) return {};
   try {
-    return JSON.parse(stored) as { players?: Player[]; pitchLog?: PitchLog };
+    return JSON.parse(stored) as {
+      players?: Player[];
+      pitchLog?: PitchLog;
+      seasonStats?: SeasonStats;
+      gameHistory?: GameRecord[];
+    };
   } catch {
     return {};
   }
+}
+
+function summarizeGame(players: Player[], assignments: Assignment[], pitchLog: PitchLog) {
+  const stats: SeasonStats = {};
+  players
+    .filter((player) => player.present)
+    .forEach((player) => {
+      stats[player.id] = emptyStats();
+      stats[player.id].games = 1;
+      stats[player.id].pitches = pitchLog[player.id] ?? 0;
+    });
+
+  assignments.forEach((assignment) => {
+    assignment.bench.forEach((player) => {
+      stats[player.id] ??= emptyStats();
+      stats[player.id].benchInnings += 1;
+    });
+    Object.entries(assignment.positions).forEach(([position, player]) => {
+      stats[player.id] ??= emptyStats();
+      stats[player.id].fieldInnings += 1;
+      stats[player.id].positions[position as Position] =
+        (stats[player.id].positions[position as Position] ?? 0) + 1;
+    });
+  });
+
+  return stats;
+}
+
+function mergeSeasonStats(current: SeasonStats, incoming: SeasonStats) {
+  const merged: SeasonStats = { ...current };
+  Object.entries(incoming).forEach(([playerId, stats]) => {
+    const existing = merged[playerId] ?? emptyStats();
+    const positions = { ...existing.positions };
+    POSITIONS.forEach((position) => {
+      positions[position] = (positions[position] ?? 0) + (stats.positions[position] ?? 0);
+    });
+    merged[playerId] = {
+      fieldInnings: existing.fieldInnings + stats.fieldInnings,
+      benchInnings: existing.benchInnings + stats.benchInnings,
+      pitches: existing.pitches + stats.pitches,
+      games: existing.games + stats.games,
+      positions,
+    };
+  });
+  return merged;
+}
+
+function emptyStats(): PlayerSeasonStats {
+  return {
+    fieldInnings: 0,
+    benchInnings: 0,
+    pitches: 0,
+    games: 0,
+    positions: {},
+  };
 }
 
 function Metric({ label, value }: { label: string; value: string }) {

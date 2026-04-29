@@ -27,6 +27,16 @@ export type Assignment = {
   notes: string[];
 };
 
+export type PlayerSeasonStats = {
+  fieldInnings: number;
+  benchInnings: number;
+  pitches: number;
+  games: number;
+  positions: Partial<Record<Position, number>>;
+};
+
+export type SeasonStats = Record<string, PlayerSeasonStats>;
+
 export const POSITIONS: Position[] = [
   "P",
   "C",
@@ -100,7 +110,7 @@ export function restDaysForPitches(pitches: number) {
   return 4;
 }
 
-export function generateAssignments(players: Player[]): Assignment[] {
+export function generateAssignments(players: Player[], seasonStats: SeasonStats = {}): Assignment[] {
   const presentPlayers = players.filter((player) => player.present);
   const defensiveSlots = Math.min(POSITIONS.length, presentPlayers.length);
   const benchSlots = Math.max(0, presentPlayers.length - defensiveSlots);
@@ -125,6 +135,9 @@ export function generateAssignments(players: Player[]): Assignment[] {
     const bench = presentPlayers
       .filter((player) => !mustField.some((locked) => locked.id === player.id))
       .sort((a, b) => {
+        const seasonBenchDelta =
+          (seasonStats[a.id]?.benchInnings ?? 0) - (seasonStats[b.id]?.benchInnings ?? 0);
+        if (seasonBenchDelta !== 0) return seasonBenchDelta;
         const benchDelta = (benchCounts.get(a.id) ?? 0) - (benchCounts.get(b.id) ?? 0);
         if (benchDelta !== 0) return benchDelta;
         const fieldDelta = (fieldCounts.get(b.id) ?? 0) - (fieldCounts.get(a.id) ?? 0);
@@ -150,7 +163,18 @@ export function generateAssignments(players: Player[]): Assignment[] {
 
     rotatedPositions.slice(0, defensiveSlots).forEach((position) => {
       const bestIndex = pool
-        .map((player, index) => ({ player, index, score: scorePlayer(player, position, inning, fieldCounts, positionCounts) }))
+        .map((player, index) => ({
+          player,
+          index,
+          score: scorePlayer(
+            player,
+            position,
+            inning,
+            fieldCounts,
+            positionCounts,
+            seasonStats,
+          ),
+        }))
         .sort((a, b) => b.score - a.score || a.player.name.localeCompare(b.player.name))[0]?.index;
 
       if (bestIndex === undefined) return;
@@ -186,10 +210,15 @@ function scorePlayer(
   inning: number,
   fieldCounts: Map<string, number>,
   positionCounts: Map<string, number>,
+  seasonStats: SeasonStats,
 ) {
   let score = 100;
+  const season = seasonStats[player.id];
   score -= (fieldCounts.get(player.id) ?? 0) * 8;
   score -= (positionCounts.get(`${player.id}:${position}`) ?? 0) * 30;
+  score -= (season?.positions[position] ?? 0) * 3;
+  score += (season?.benchInnings ?? 0) * 1.5;
+  score -= (season?.fieldInnings ?? 0) * 0.4;
   score += player.wants.includes(position) ? 25 : 0;
   score -= player.avoid.includes(position) ? 40 : 0;
   score += ((player.id.charCodeAt(player.id.length - 1) + inning) % 7) / 10;
