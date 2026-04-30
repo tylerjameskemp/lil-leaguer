@@ -1,7 +1,7 @@
 "use client";
 
 import { createClient } from "@supabase/supabase-js";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AAA_RULES,
   DEFAULT_PLAYERS,
@@ -54,6 +54,11 @@ export default function Home() {
   const [joinCode, setJoinCode] = useState("");
   const [syncMessage, setSyncMessage] = useState("");
   const lastSyncedStateRef = useRef("");
+  const latestSignatureRef = useRef("");
+  const latestSessionRef = useRef<TeamSession | undefined>(stored.teamSession);
+  const remoteApplyRef = useRef(false);
+  const saveRequestRef = useRef(0);
+  const syncStatusRef = useRef(syncStatus);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -101,9 +106,60 @@ export default function Home() {
   );
 
   useEffect(() => {
-    if (!teamSession) return;
+    latestSessionRef.current = teamSession;
+  }, [teamSession]);
+
+  useEffect(() => {
+    syncStatusRef.current = syncStatus;
+  }, [syncStatus]);
+
+  useEffect(() => {
+    latestSignatureRef.current = JSON.stringify(sharedGameState);
+  }, [sharedGameState]);
+
+  const applyRemoteState = useCallback((state: SharedGameState) => {
+    setPlayers(state.players);
+    setPitchLog(state.pitchLog);
+    setPitchQueue(state.pitchQueue);
+    setSeasonStats(state.seasonStats);
+    setGameHistory(state.gameHistory);
+    setGamePlan(state.gamePlan);
+    setInningsPlayed(state.inningsPlayed);
+  }, []);
+
+  const applyRemoteGame = useCallback(
+    (game: { state: SharedGameState; version: number }, message: string) => {
+      const signature = JSON.stringify(game.state);
+      remoteApplyRef.current = true;
+      lastSyncedStateRef.current = signature;
+      latestSignatureRef.current = signature;
+      applyRemoteState(game.state);
+      setTeamSession((current) => (current ? { ...current, version: game.version } : current));
+      setSyncStatus("live");
+      setSyncMessage(message);
+    },
+    [applyRemoteState],
+  );
+
+  const hasUnsavedLocalChanges = useCallback(
+    () =>
+      latestSignatureRef.current !== lastSyncedStateRef.current ||
+      syncStatusRef.current === "saving",
+    [],
+  );
+
+  useEffect(() => {
+    if (!teamSession?.gameId) return;
 
     const signature = JSON.stringify(sharedGameState);
+    latestSignatureRef.current = signature;
+
+    if (remoteApplyRef.current) {
+      remoteApplyRef.current = false;
+      lastSyncedStateRef.current = signature;
+      return;
+    }
+
     if (!lastSyncedStateRef.current) {
       lastSyncedStateRef.current = signature;
       return;
@@ -111,26 +167,29 @@ export default function Home() {
     if (signature === lastSyncedStateRef.current) return;
 
     const timeout = window.setTimeout(async () => {
+      const session = latestSessionRef.current;
+      if (!session) return;
+
+      const saveId = saveRequestRef.current + 1;
+      saveRequestRef.current = saveId;
       setSyncStatus("saving");
+      setSyncMessage("");
       try {
-        const response = await fetch(`/api/game/${teamSession.gameId}`, {
+        const response = await fetch(`/api/game/${session.gameId}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ state: sharedGameState, version: teamSession.version }),
+          body: JSON.stringify({ state: sharedGameState, version: session.version }),
         });
         const payload = (await response.json()) as {
           game?: { state: SharedGameState; version: number };
           error?: string;
         };
 
+        if (saveId !== saveRequestRef.current) return;
+
         if (response.status === 409 && payload.game) {
-          applyRemoteState(payload.game.state);
-          setTeamSession((current) =>
-            current ? { ...current, version: payload.game?.version ?? current.version } : current,
-          );
-          lastSyncedStateRef.current = JSON.stringify(payload.game.state);
+          applyRemoteGame(payload.game, "Another coach updated first. Pulled their latest game state.");
           setSyncStatus("conflict");
-          setSyncMessage("Another coach updated first. Pulled their latest game state.");
           return;
         }
 
@@ -139,9 +198,9 @@ export default function Home() {
         setTeamSession((current) =>
           current ? { ...current, version: payload.game?.version ?? current.version } : current,
         );
-        lastSyncedStateRef.current = JSON.stringify(payload.game.state);
+        lastSyncedStateRef.current = signature;
         setSyncStatus("live");
-        setSyncMessage("Saved.");
+        setSyncMessage("");
       } catch (error) {
         setSyncStatus("offline");
         setSyncMessage(String(error));
@@ -149,58 +208,53 @@ export default function Home() {
     }, 700);
 
     return () => window.clearTimeout(timeout);
-  }, [sharedGameState, teamSession]);
+  }, [applyRemoteGame, sharedGameState, teamSession?.gameId]);
 
   useEffect(() => {
-    if (!teamSession) return;
+    if (!teamSession?.gameId) return;
 
     const interval = window.setInterval(async () => {
       try {
-        const response = await fetch(`/api/game/${teamSession.gameId}`);
+        const session = latestSessionRef.current;
+        if (!session) return;
+        const response = await fetch(`/api/game/${session.gameId}`);
         const payload = (await response.json()) as {
           game?: { state: SharedGameState; version: number };
         };
-        if (!payload.game || payload.game.version <= teamSession.version) return;
+        if (!payload.game || payload.game.version <= (latestSessionRef.current?.version ?? 0)) return;
+        if (hasUnsavedLocalChanges()) return;
 
-        applyRemoteState(payload.game.state);
-        setTeamSession((current) =>
-          current ? { ...current, version: payload.game?.version ?? current.version } : current,
-        );
-        lastSyncedStateRef.current = JSON.stringify(payload.game.state);
-        setSyncStatus("live");
-        setSyncMessage("Updated from another coach.");
+        applyRemoteGame(payload.game, "Updated from another coach.");
       } catch {
         setSyncStatus("offline");
       }
     }, 4000);
 
     return () => window.clearInterval(interval);
-  }, [teamSession]);
+  }, [applyRemoteGame, hasUnsavedLocalChanges, teamSession?.gameId]);
 
   useEffect(() => {
-    if (!teamSession || !SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) return;
+    if (!teamSession?.gameId || !SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) return;
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+    const gameId = teamSession.gameId;
     const channel = supabase
-      .channel(`game:${teamSession.gameId}`)
+      .channel(`game:${gameId}`)
       .on(
         "postgres_changes",
         {
           event: "UPDATE",
           schema: "public",
           table: "games",
-          filter: `id=eq.${teamSession.gameId}`,
+          filter: `id=eq.${gameId}`,
         },
         (payload) => {
           const next = payload.new as { state?: SharedGameState; version?: number };
-          if (!next.state || !next.version || next.version <= teamSession.version) return;
-          applyRemoteState(next.state);
-          setTeamSession((current) =>
-            current ? { ...current, version: next.version ?? current.version } : current,
-          );
-          lastSyncedStateRef.current = JSON.stringify(next.state);
-          setSyncStatus("live");
-          setSyncMessage("Live update received.");
+          if (!next.state || !next.version || next.version <= (latestSessionRef.current?.version ?? 0)) {
+            return;
+          }
+          if (hasUnsavedLocalChanges()) return;
+          applyRemoteGame({ state: next.state, version: next.version }, "Live update received.");
         },
       )
       .subscribe();
@@ -208,17 +262,7 @@ export default function Home() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [teamSession]);
-
-  function applyRemoteState(state: SharedGameState) {
-    setPlayers(state.players);
-    setPitchLog(state.pitchLog);
-    setPitchQueue(state.pitchQueue);
-    setSeasonStats(state.seasonStats);
-    setGameHistory(state.gameHistory);
-    setGamePlan(state.gamePlan);
-    setInningsPlayed(state.inningsPlayed);
-  }
+  }, [applyRemoteGame, hasUnsavedLocalChanges, teamSession?.gameId]);
 
   async function createTeam() {
     setSyncStatus("saving");
@@ -286,13 +330,6 @@ export default function Home() {
       setSyncStatus("offline");
       setSyncMessage(String(error));
     }
-  }
-
-  function leaveTeam() {
-    setTeamSession(undefined);
-    lastSyncedStateRef.current = "";
-    setSyncStatus("local");
-    setSyncMessage("Using this phone only.");
   }
 
   function regeneratePlan() {
@@ -463,12 +500,19 @@ export default function Home() {
               </p>
               <h1 className="text-2xl font-bold tracking-normal">Lil Leaguer</h1>
             </div>
-            <button
-              className="h-11 rounded-md bg-[#176a5f] px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-[#0f554c]"
-              onClick={regeneratePlan}
-            >
-              Generate
-            </button>
+            <div className="flex items-center gap-2">
+              <SyncBadge
+                syncStatus={syncStatus}
+                teamSession={teamSession}
+                message={syncMessage}
+              />
+              <button
+                className="h-11 rounded-md bg-[#176a5f] px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-[#0f554c]"
+                onClick={regeneratePlan}
+              >
+                Generate
+              </button>
+            </div>
           </div>
 
           <div className="mt-3 grid grid-cols-3 gap-2 text-center">
@@ -480,18 +524,18 @@ export default function Home() {
       </header>
 
       <div className="mx-auto max-w-5xl px-4 pb-24 pt-4">
-        <SyncPanel
-          joinCode={joinCode}
-          setJoinCode={setJoinCode}
-          setTeamName={setTeamName}
-          syncMessage={syncMessage}
-          syncStatus={syncStatus}
-          teamName={teamName}
-          teamSession={teamSession}
-          onCreate={createTeam}
-          onJoin={joinTeam}
-          onLeave={leaveTeam}
-        />
+        {!teamSession ? (
+          <SyncPanel
+            joinCode={joinCode}
+            setJoinCode={setJoinCode}
+            setTeamName={setTeamName}
+            syncMessage={syncMessage}
+            syncStatus={syncStatus}
+            teamName={teamName}
+            onCreate={createTeam}
+            onJoin={joinTeam}
+          />
+        ) : null}
 
         {activeTab === "game" ? (
           <GameTab
@@ -564,10 +608,8 @@ function SyncPanel({
   syncMessage,
   syncStatus,
   teamName,
-  teamSession,
   onCreate,
   onJoin,
-  onLeave,
 }: {
   joinCode: string;
   setJoinCode: (code: string) => void;
@@ -575,42 +617,9 @@ function SyncPanel({
   syncMessage: string;
   syncStatus: "local" | "live" | "saving" | "offline" | "conflict";
   teamName: string;
-  teamSession?: TeamSession;
   onCreate: () => void;
   onJoin: () => void;
-  onLeave: () => void;
 }) {
-  if (teamSession) {
-    return (
-      <section className="mb-4 rounded-lg border border-[#9bc6bc] bg-[#e8f3f0] p-3 shadow-sm">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <div className="text-sm font-bold text-[#176a5f]">{teamSession.teamName}</div>
-            <div className="mt-1 text-2xl font-bold tracking-normal text-[#17211f]">
-              {teamSession.shareCode}
-            </div>
-            <p className="mt-1 text-xs font-semibold uppercase tracking-[0.1em] text-[#4d5a55]">
-              {syncStatus === "saving"
-                ? "Saving"
-                : syncStatus === "offline"
-                  ? "Offline"
-                  : syncStatus === "conflict"
-                    ? "Updated"
-                    : "Live sync"}
-            </p>
-            {syncMessage ? <p className="mt-1 text-sm text-[#4d5a55]">{syncMessage}</p> : null}
-          </div>
-          <button
-            className="h-10 rounded-md border border-[#9bc6bc] bg-white px-3 text-sm font-semibold text-[#176a5f]"
-            onClick={onLeave}
-          >
-            Leave
-          </button>
-        </div>
-      </section>
-    );
-  }
-
   return (
     <section className="mb-4 rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
       <div>
@@ -655,6 +664,49 @@ function SyncPanel({
       </div>
       {syncMessage ? <p className="mt-2 text-sm text-[#66716d]">{syncMessage}</p> : null}
     </section>
+  );
+}
+
+function SyncBadge({
+  message,
+  syncStatus,
+  teamSession,
+}: {
+  message: string;
+  syncStatus: "local" | "live" | "saving" | "offline" | "conflict";
+  teamSession?: TeamSession;
+}) {
+  if (!teamSession) {
+    return (
+      <span className="hidden h-11 items-center rounded-md border border-[#d8d2c4] bg-white px-3 text-xs font-bold text-[#66716d] sm:flex">
+        Local
+      </span>
+    );
+  }
+
+  const label =
+    syncStatus === "saving"
+      ? "Saving"
+      : syncStatus === "offline"
+        ? "Offline"
+        : syncStatus === "conflict"
+          ? "Updated"
+          : "Live";
+  const tone =
+    syncStatus === "offline"
+      ? "border-[#e6c08b] bg-[#fff8e9] text-[#9b3d2e]"
+      : syncStatus === "saving"
+        ? "border-[#d8d2c4] bg-white text-[#66716d]"
+        : "border-[#9bc6bc] bg-[#e8f3f0] text-[#176a5f]";
+
+  return (
+    <span
+      className={`flex h-11 min-w-20 flex-col justify-center rounded-md border px-3 text-right text-xs font-bold ${tone}`}
+      title={message || teamSession.teamName}
+    >
+      <span>{label}</span>
+      <span className="font-mono text-[0.68rem]">{teamSession.shareCode}</span>
+    </span>
   );
 }
 
