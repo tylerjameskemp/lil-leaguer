@@ -30,7 +30,8 @@ import type {
   TeamSession,
 } from "@/lib/shared-game";
 
-type Tab = "field" | "batting" | "pitch" | "roster" | "season";
+type Tab = "today" | "field" | "batting" | "pitch" | "roster" | "season";
+type ScheduleStatus = "planned" | "today" | "in_progress" | "completed" | "past";
 type StoredState = {
   players?: Player[];
   pitchLog?: PitchLog;
@@ -103,7 +104,7 @@ export default function Home() {
       generateAssignments(initialPlayers, migratedStarterRoster ? {} : stored.seasonStats ?? {}),
   );
   const [inningsPlayed, setInningsPlayed] = useState(() => stored.inningsPlayed ?? 4);
-  const [activeTab, setActiveTab] = useState<Tab>("field");
+  const [activeTab, setActiveTab] = useState<Tab>("today");
   const [menuOpen, setMenuOpen] = useState(false);
   const [teamSession, setTeamSession] = useState<TeamSession | undefined>(() => stored.teamSession);
   const [syncStatus, setSyncStatus] = useState<"local" | "live" | "saving" | "offline" | "conflict">(
@@ -174,8 +175,20 @@ export default function Home() {
     [pitchQueue, players],
   );
   const activePitcher =
-    players.find((player) => player.id === pitchTracker.pitcherId) ?? pitcherQueuePlayers[0];
+    activeAssignment?.positions.P ??
+    players.find((player) => player.id === pitchTracker.pitcherId) ??
+    pitcherQueuePlayers[0];
   const activePitchCount = activePitcher ? pitchLog[activePitcher.id] ?? 0 : 0;
+  const selectedEventStatus = activeSeasonEvent
+    ? eventStatus(activeSeasonEvent, gameHistory, activeEventId, gameFlow)
+    : "planned";
+  const featuredEvent =
+    todaysGame(seasonSchedule) ??
+    seasonSchedule.find((event) => event.id === activeEventId) ??
+    nextScheduledGame(seasonSchedule);
+  const featuredEventStatus = featuredEvent
+    ? eventStatus(featuredEvent, gameHistory, activeEventId, gameFlow)
+    : "planned";
   const battingOrderPlayers = useMemo(() => {
     const presentIds = new Set(presentPlayers.map((player) => player.id));
     const ordered = battingOrder
@@ -658,6 +671,13 @@ export default function Home() {
     );
   }
 
+  function assignGamePosition(inning: number, position: Position, playerId: string) {
+    assignPosition(inning, position, playerId);
+    if (position === "P" && inning === activeInning) {
+      syncPitcherTracker(playerId, "Pitcher changed on Field.");
+    }
+  }
+
   function benchPlayer(inning: number, playerId: string) {
     setGamePlan((current) =>
       current.map((assignment) => {
@@ -710,12 +730,16 @@ export default function Home() {
 
   function selectSeasonEvent(eventId: string) {
     const event = seasonSchedule.find((candidate) => candidate.id === eventId);
+    const isAlreadyActive = eventId === activeEventId;
     setActiveEventId(eventId);
-    setGameFlow((current) => ({
-      ...current,
-      battingHalf: inferBattingHalf(event),
-      notice: event ? `Selected ${event.title}.` : current.notice,
-    }));
+    if (!isAlreadyActive) {
+      setGameFlow(defaultGameFlow(event));
+    }
+  }
+
+  function openEvent(eventId: string, tab: Tab = "field") {
+    selectSeasonEvent(eventId);
+    setActiveTab(tab);
   }
 
   function addPitcher(playerId: string) {
@@ -742,6 +766,20 @@ export default function Home() {
     setPitchQueue((current) => current.filter((id) => id !== playerId));
   }
 
+  function syncPitcherTracker(playerId: string, notice = "Pitcher changed.") {
+    setPitchTracker((current) => ({
+      ...current,
+      pitcherId: playerId || undefined,
+      notice: playerId ? notice : "Pitcher cleared.",
+    }));
+    if (playerId) addPitcher(playerId);
+  }
+
+  function changeCurrentPitcher(playerId: string) {
+    assignPosition(activeInning, "P", playerId);
+    syncPitcherTracker(playerId);
+  }
+
   function moveBatter(playerId: string, direction: -1 | 1) {
     setBattingOrder((current) => {
       const normalized = normalizeBattingOrder(players, current);
@@ -764,6 +802,11 @@ export default function Home() {
                 Portland AAA
               </p>
               <h1 className="text-2xl font-bold tracking-normal">Lil Leaguer</h1>
+              {activeSeasonEvent ? (
+                <p className="mt-0.5 max-w-[210px] truncate text-xs font-semibold text-[#66716d] sm:max-w-md">
+                  {eventStatusLabel(selectedEventStatus)} · {activeSeasonEvent.title}
+                </p>
+              ) : null}
             </div>
             <div className="relative flex items-center gap-2">
               <SyncBadge syncStatus={syncStatus} teamSession={teamSession} message={syncMessage} />
@@ -780,21 +823,28 @@ export default function Home() {
               </button>
               {menuOpen ? (
                 <div className="absolute right-0 top-12 z-40 w-56 rounded-lg border border-[#d8d2c4] bg-white p-2 text-sm shadow-lg">
-                  <button
-                    className={`w-full rounded-md px-3 py-3 text-left font-semibold ${
-                      activeTab === "season" ? "bg-[#e8f3f0] text-[#176a5f]" : "hover:bg-[#fbfaf5]"
-                    }`}
-                    type="button"
-                    onClick={() => {
-                      setActiveTab("season");
-                      setMenuOpen(false);
-                    }}
-                  >
-                    Season
-                    <span className="mt-0.5 block text-xs font-normal text-[#66716d]">
-                      Schedule, saved games, fairness totals
-                    </span>
-                  </button>
+                  {[
+                    ["today", "Today", "Start here before a game"],
+                    ["season", "Season", "Schedule, saved games, fairness"],
+                    ["roster", "Roster", "Attendance and player asks"],
+                  ].map(([tab, label, description]) => (
+                    <button
+                      key={tab}
+                      className={`w-full rounded-md px-3 py-3 text-left font-semibold ${
+                        activeTab === tab ? "bg-[#e8f3f0] text-[#176a5f]" : "hover:bg-[#fbfaf5]"
+                      }`}
+                      type="button"
+                      onClick={() => {
+                        setActiveTab(tab as Tab);
+                        setMenuOpen(false);
+                      }}
+                    >
+                      {label}
+                      <span className="mt-0.5 block text-xs font-normal text-[#66716d]">
+                        {description}
+                      </span>
+                    </button>
+                  ))}
                 </div>
               ) : null}
             </div>
@@ -823,17 +873,31 @@ export default function Home() {
           />
         ) : null}
 
-        <GameControl
-          battingHalf={battingHalf}
-          gameFlow={gameFlow}
-          isOurBattingHalf={isOurBattingHalf}
-          lineupSize={battingOrderPlayers.length}
-          onNextHalf={nextHalfInning}
-          onOut={() => recordOut()}
-          onRun={() => recordRun("auto")}
-          onToggleBattingHalf={toggleBattingHalf}
-          onUndo={undoGameFlow}
-        />
+        {activeTab === "field" || activeTab === "batting" || activeTab === "pitch" ? (
+          <GameControl
+            battingHalf={battingHalf}
+            gameFlow={gameFlow}
+            isOurBattingHalf={isOurBattingHalf}
+            lineupSize={battingOrderPlayers.length}
+            onNextHalf={nextHalfInning}
+            onOut={() => recordOut()}
+            onRun={() => recordRun("auto")}
+            onToggleBattingHalf={toggleBattingHalf}
+            onUndo={undoGameFlow}
+          />
+        ) : null}
+
+        {activeTab === "today" ? (
+          <TodayTab
+            event={featuredEvent}
+            eventStatus={featuredEventStatus}
+            gameFlow={gameFlow}
+            teamSession={teamSession}
+            onOpenEvent={(eventId, tab) => openEvent(eventId, tab)}
+            onOpenRoster={() => setActiveTab("roster")}
+            onOpenSeason={() => setActiveTab("season")}
+          />
+        ) : null}
 
         {activeTab === "field" ? (
           <GameTab
@@ -845,7 +909,7 @@ export default function Home() {
             pitcherQueue={pitcherQueuePlayers}
             players={players}
             seasonEvent={activeSeasonEvent}
-            onAssign={assignPosition}
+            onAssign={assignGamePosition}
             onBench={benchPlayer}
             onSave={saveGameToSeason}
           />
@@ -884,7 +948,9 @@ export default function Home() {
             pitchQueue={pitcherQueuePlayers}
             setPitchLog={setPitchLog}
             setPitchTracker={setPitchTracker}
+            currentPitcherId={activeAssignment?.positions.P?.id}
             onAddPitcher={addPitcher}
+            onChangeCurrentPitcher={changeCurrentPitcher}
             onOut={() => recordOut()}
             onRunAllowed={() => recordRun("theirs")}
             onMovePitcher={movePitcher}
@@ -896,25 +962,132 @@ export default function Home() {
           <SeasonTab
             activeEventId={activeEventId}
             currentGameStats={gameSummary}
+            gameFlow={gameFlow}
             gameHistory={gameHistory}
             players={players}
             schedule={seasonSchedule}
             seasonStats={seasonStats}
             onReset={resetSeason}
-            onSelectEvent={selectSeasonEvent}
+            onOpenEvent={openEvent}
           />
         ) : null}
       </div>
 
       <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-[#d8d2c4] bg-[#fbfaf5]/95 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-2 backdrop-blur">
-        <div className="mx-auto grid max-w-5xl grid-cols-4 gap-1.5">
+        <div className="mx-auto grid max-w-5xl grid-cols-3 gap-1.5">
           <TabButton active={activeTab === "field"} label="Field" onClick={() => setActiveTab("field")} />
           <TabButton active={activeTab === "batting"} label="Bat" onClick={() => setActiveTab("batting")} />
           <TabButton active={activeTab === "pitch"} label="Pitch" onClick={() => setActiveTab("pitch")} />
-          <TabButton active={activeTab === "roster"} label="Roster" onClick={() => setActiveTab("roster")} />
         </div>
       </nav>
     </main>
+  );
+}
+
+function TodayTab({
+  event,
+  eventStatus,
+  gameFlow,
+  teamSession,
+  onOpenEvent,
+  onOpenRoster,
+  onOpenSeason,
+}: {
+  event?: SeasonEvent;
+  eventStatus: ScheduleStatus;
+  gameFlow: GameFlow;
+  teamSession?: TeamSession;
+  onOpenEvent: (eventId: string, tab: Tab) => void;
+  onOpenRoster: () => void;
+  onOpenSeason: () => void;
+}) {
+  const primaryLabel =
+    eventStatus === "completed"
+      ? "View game"
+      : eventStatus === "planned"
+        ? "Plan game"
+        : "Manage game";
+  const primaryTab: Tab = eventStatus === "planned" ? "roster" : "field";
+
+  return (
+    <section className="space-y-4">
+      <div className="rounded-lg border border-[#d8d2c4] bg-white p-4 shadow-sm">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs font-bold uppercase tracking-[0.12em] text-[#9b3d2e]">Start here</p>
+            <h2 className="mt-1 text-2xl font-bold">Today</h2>
+            <p className="mt-1 text-sm leading-6 text-[#66716d]">
+              Pick the thing you are actually doing: manage today&apos;s game, plan the next one, or adjust the roster.
+            </p>
+          </div>
+          <span className="rounded-md bg-[#e8f3f0] px-2 py-1 text-xs font-bold text-[#176a5f]">
+            {teamSession ? "Shared" : "Local"}
+          </span>
+        </div>
+      </div>
+
+      {event ? (
+        <div className="rounded-lg border border-[#176a5f] bg-white p-4 shadow-sm">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded-md bg-[#176a5f] px-2 py-1 text-xs font-bold uppercase text-white">
+                  {eventStatusLabel(eventStatus)}
+                </span>
+                <span className="text-xs font-bold uppercase tracking-[0.12em] text-[#66716d]">
+                  {event.type}
+                </span>
+              </div>
+              <h3 className="mt-3 text-xl font-bold">{event.title}</h3>
+              <p className="mt-1 text-sm font-semibold text-[#176a5f]">
+                {formatEventDateTime(event.start)} · {shortFieldName(event.field)}
+              </p>
+              <p className="mt-1 text-sm text-[#66716d]">{event.location}</p>
+            </div>
+          </div>
+
+          {eventStatus === "in_progress" ? (
+            <div className="mt-3 grid grid-cols-4 gap-2 text-center">
+              <MiniStat label="Inning" value={`${halfLabel(gameFlow.half)} ${gameFlow.inning}`} />
+              <MiniStat label="Score" value={`${gameFlow.ourRuns}-${gameFlow.theirRuns}`} />
+              <MiniStat label="Outs" value={`${gameFlow.outs}`} />
+              <MiniStat label="Runs" value={`${gameFlow.runsThisHalf}/5`} />
+            </div>
+          ) : null}
+
+          <button
+            className="mt-4 h-12 w-full rounded-md bg-[#176a5f] px-4 text-base font-semibold text-white shadow-sm"
+            type="button"
+            onClick={() => onOpenEvent(event.id, primaryTab)}
+          >
+            {primaryLabel}
+          </button>
+        </div>
+      ) : (
+        <div className="rounded-lg border border-[#d8d2c4] bg-white p-4 text-sm text-[#66716d] shadow-sm">
+          No games are on the schedule yet. Add or import the season schedule, then this screen can point coaches to the right game.
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          className="min-h-16 rounded-lg border border-[#d8d2c4] bg-white p-3 text-left shadow-sm"
+          type="button"
+          onClick={onOpenSeason}
+        >
+          <span className="block font-bold">Season</span>
+          <span className="mt-1 block text-xs text-[#66716d]">Schedule and saved games</span>
+        </button>
+        <button
+          className="min-h-16 rounded-lg border border-[#d8d2c4] bg-white p-3 text-left shadow-sm"
+          type="button"
+          onClick={onOpenRoster}
+        >
+          <span className="block font-bold">Roster</span>
+          <span className="mt-1 block text-xs text-[#66716d]">Attendance and requests</span>
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -1453,6 +1626,7 @@ function RosterTab({
 }
 
 function PitchTab({
+  currentPitcherId,
   gameFlow,
   players,
   pitchLog,
@@ -1462,11 +1636,13 @@ function PitchTab({
   setPitchLog,
   setPitchTracker,
   onAddPitcher,
+  onChangeCurrentPitcher,
   onOut,
   onRunAllowed,
   onMovePitcher,
   onRemovePitcher,
 }: {
+  currentPitcherId?: string;
   gameFlow: GameFlow;
   players: Player[];
   pitchLog: PitchLog;
@@ -1476,6 +1652,7 @@ function PitchTab({
   setPitchLog: React.Dispatch<React.SetStateAction<PitchLog>>;
   setPitchTracker: React.Dispatch<React.SetStateAction<PitchTracker>>;
   onAddPitcher: (playerId: string) => void;
+  onChangeCurrentPitcher: (playerId: string) => void;
   onOut: () => void;
   onRunAllowed: () => void;
   onMovePitcher: (playerId: string, direction: -1 | 1) => void;
@@ -1486,21 +1663,19 @@ function PitchTab({
     (player) => player.present && player.wants.includes("P") && !pitchQueue.some((queued) => queued.id === player.id),
   );
   const activePitcher =
-    players.find((player) => player.id === pitchTracker.pitcherId) ?? pitchQueue[0];
+    players.find((player) => player.id === currentPitcherId) ??
+    players.find((player) => player.id === pitchTracker.pitcherId) ??
+    pitchQueue[0];
   const activePitchCount = activePitcher ? pitchLog[activePitcher.id] ?? 0 : 0;
   const activeLimit = activePitcher ? pitchLimitForAge(activePitcher.age) : 0;
   const canTrack = Boolean(activePitcher);
 
   function selectTrackerPitcher(playerId: string) {
-    setPitchTracker((current) => ({
-      ...current,
-      pitcherId: playerId || undefined,
-      notice: playerId ? "Pitch tracker ready." : "Choose the current pitcher.",
-    }));
+    onChangeCurrentPitcher(playerId);
   }
 
   function recordPitch(action: "ball" | "strike" | "foul" | "inPlay" | "out") {
-    const pitcherId = pitchTracker.pitcherId ?? activePitcher?.id;
+    const pitcherId = currentPitcherId ?? pitchTracker.pitcherId ?? activePitcher?.id;
     if (!pitcherId) {
       setPitchTracker((current) => ({ ...current, notice: "Choose the current pitcher first." }));
       return;
@@ -1531,7 +1706,7 @@ function PitchTab({
   }
 
   function startCoachPitch() {
-    const pitcherId = pitchTracker.pitcherId ?? activePitcher?.id;
+    const pitcherId = currentPitcherId ?? pitchTracker.pitcherId ?? activePitcher?.id;
     setPitchTracker((current) => ({
       ...current,
       pitcherId,
@@ -1861,90 +2036,88 @@ function PitchTab({
 function SeasonTab({
   activeEventId,
   currentGameStats,
+  gameFlow,
   gameHistory,
   players,
   schedule,
   seasonStats,
   onReset,
-  onSelectEvent,
+  onOpenEvent,
 }: {
   activeEventId?: string;
   currentGameStats: SeasonStats;
+  gameFlow: GameFlow;
   gameHistory: GameRecord[];
   players: Player[];
   schedule: SeasonEvent[];
   seasonStats: SeasonStats;
   onReset: () => void;
-  onSelectEvent: (eventId: string) => void;
+  onOpenEvent: (eventId: string, tab?: Tab) => void;
 }) {
-  const savedEventIds = new Set(gameHistory.map((game) => game.scheduleEventId).filter(Boolean));
+  const sortedSchedule = [...schedule].sort(
+    (a, b) => new Date(a.start).getTime() - new Date(b.start).getTime(),
+  );
+  const statusFor = (event: SeasonEvent) => eventStatus(event, gameHistory, activeEventId, gameFlow);
+  const currentEvents = sortedSchedule.filter((event) => {
+    const status = statusFor(event);
+    return status === "today" || status === "in_progress";
+  });
+  const upcomingEvents = sortedSchedule.filter((event) => statusFor(event) === "planned");
+  const completedEvents = sortedSchedule.filter((event) => {
+    const status = statusFor(event);
+    return status === "completed" || status === "past";
+  });
 
   return (
     <section className="space-y-4">
-      <div className="flex items-end justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-semibold">Season</h2>
-          <p className="text-sm text-[#66716d]">Pick the game, then save innings after it ends.</p>
-        </div>
+      <div className="rounded-lg border border-[#d8d2c4] bg-white p-4 shadow-sm">
+        <p className="text-xs font-bold uppercase tracking-[0.12em] text-[#9b3d2e]">Season hub</p>
+        <h2 className="mt-1 text-2xl font-bold">Schedule</h2>
+        <p className="mt-1 text-sm leading-6 text-[#66716d]">
+          Use this for planning future games and reviewing completed ones. Live game work still happens in Field, Bat, and Pitch.
+        </p>
+      </div>
+
+      <ScheduleSection
+        activeEventId={activeEventId}
+        emptyText="No game or practice is scheduled for today."
+        events={currentEvents}
+        gameFlow={gameFlow}
+        gameHistory={gameHistory}
+        title="Current"
+        onOpenEvent={onOpenEvent}
+      />
+
+      <ScheduleSection
+        activeEventId={activeEventId}
+        emptyText="No future games are left on the schedule."
+        events={upcomingEvents}
+        gameFlow={gameFlow}
+        gameHistory={gameHistory}
+        title="Upcoming"
+        onOpenEvent={onOpenEvent}
+      />
+
+      <ScheduleSection
+        activeEventId={activeEventId}
+        emptyText="Saved games will show here after you end them."
+        events={completedEvents}
+        gameFlow={gameFlow}
+        gameHistory={gameHistory}
+        title="Completed & Past"
+        onOpenEvent={onOpenEvent}
+      />
+
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-bold uppercase tracking-[0.12em] text-[#176a5f]">
+          Fairness
+        </h3>
         <button
           className="h-10 rounded-md border border-[#d8d2c4] px-3 text-sm font-semibold"
           onClick={onReset}
         >
           Reset
         </button>
-      </div>
-
-      <div className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
-        <h3 className="text-sm font-bold uppercase tracking-[0.12em] text-[#176a5f]">
-          Schedule
-        </h3>
-        <div className="mt-3 space-y-2">
-          {schedule.map((event) => {
-            const active = event.id === activeEventId;
-            const saved = savedEventIds.has(event.id);
-            return (
-              <button
-                key={event.id}
-                className={`w-full rounded-md border p-3 text-left transition ${
-                  active ? "border-[#176a5f] bg-[#e8f3f0]" : "border-[#d8d2c4] bg-[#fbfaf5]"
-                }`}
-                onClick={() => onSelectEvent(event.id)}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="truncate font-semibold">{event.title}</div>
-                    <div className="text-sm text-[#66716d]">
-                      {formatEventDateTime(event.start)} · {shortFieldName(event.field)}
-                    </div>
-                    <div className="mt-1 truncate text-xs text-[#66716d]">{event.location}</div>
-                  </div>
-                  <div className="flex shrink-0 flex-col items-end gap-1">
-                    <span
-                      className={`rounded-md px-2 py-1 text-xs font-bold uppercase ${
-                        event.type === "game"
-                          ? "bg-[#176a5f] text-white"
-                          : "bg-[#efe9da] text-[#5f5541]"
-                      }`}
-                    >
-                      {event.type}
-                    </span>
-                    {active ? (
-                      <span className="text-xs font-bold text-[#176a5f]">Selected</span>
-                    ) : null}
-                    {saved ? <span className="text-xs font-bold text-[#66716d]">Saved</span> : null}
-                  </div>
-                </div>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-bold uppercase tracking-[0.12em] text-[#176a5f]">
-          Fairness
-        </h3>
-        <span className="text-xs font-semibold text-[#66716d]">{players.length} players</span>
       </div>
 
       <div className="space-y-2">
@@ -2000,6 +2173,84 @@ function SeasonTab({
   );
 }
 
+function ScheduleSection({
+  activeEventId,
+  emptyText,
+  events,
+  gameFlow,
+  gameHistory,
+  title,
+  onOpenEvent,
+}: {
+  activeEventId?: string;
+  emptyText: string;
+  events: SeasonEvent[];
+  gameFlow: GameFlow;
+  gameHistory: GameRecord[];
+  title: string;
+  onOpenEvent: (eventId: string, tab?: Tab) => void;
+}) {
+  return (
+    <div className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
+      <h3 className="text-sm font-bold uppercase tracking-[0.12em] text-[#176a5f]">{title}</h3>
+      <div className="mt-3 space-y-2">
+        {events.length ? (
+          events.map((event) => {
+            const status = eventStatus(event, gameHistory, activeEventId, gameFlow);
+            const active = event.id === activeEventId;
+            const actionLabel =
+              status === "completed" || status === "past"
+                ? "Review"
+                : status === "planned"
+                  ? "Plan"
+                  : "Manage";
+            const targetTab: Tab =
+              status === "completed" || status === "past"
+                ? "season"
+                : status === "planned"
+                  ? "roster"
+                  : "field";
+
+            return (
+              <div
+                key={event.id}
+                className={`rounded-md border p-3 ${
+                  active ? "border-[#176a5f] bg-[#e8f3f0]" : "border-[#d8d2c4] bg-[#fbfaf5]"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate font-semibold">{event.title}</div>
+                    <div className="text-sm text-[#66716d]">
+                      {formatEventDateTime(event.start)} · {shortFieldName(event.field)}
+                    </div>
+                    <div className="mt-1 truncate text-xs text-[#66716d]">{event.location}</div>
+                  </div>
+                  <div className="flex shrink-0 flex-col items-end gap-1">
+                    <span className="rounded-md bg-[#176a5f] px-2 py-1 text-xs font-bold uppercase text-white">
+                      {eventStatusLabel(status)}
+                    </span>
+                    <span className="text-xs font-bold uppercase text-[#66716d]">{event.type}</span>
+                  </div>
+                </div>
+                <button
+                  className="mt-3 h-10 w-full rounded-md border border-[#d8d2c4] bg-white text-sm font-semibold"
+                  type="button"
+                  onClick={() => onOpenEvent(event.id, targetTab)}
+                >
+                  {actionLabel}
+                </button>
+              </div>
+            );
+          })
+        ) : (
+          <p className="rounded-md bg-[#fbfaf5] px-3 py-3 text-sm text-[#66716d]">{emptyText}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function readStoredState(): StoredState {
   if (typeof window === "undefined") return {};
   const stored = window.localStorage.getItem(STORAGE_KEY);
@@ -2009,6 +2260,58 @@ function readStoredState(): StoredState {
   } catch {
     return {};
   }
+}
+
+function eventStatus(
+  event: SeasonEvent,
+  gameHistory: GameRecord[],
+  activeEventId?: string,
+  gameFlow?: GameFlow,
+): ScheduleStatus {
+  if (gameHistory.some((game) => game.scheduleEventId === event.id)) return "completed";
+  if (event.id === activeEventId && gameFlow?.status === "live") return "in_progress";
+
+  const eventKey = easternDateKey(event.start);
+  const todayKey = easternDateKey(new Date().toISOString());
+  if (eventKey === todayKey) return "today";
+  if (eventKey < todayKey) return "past";
+  return "planned";
+}
+
+function todaysGame(schedule: SeasonEvent[]) {
+  const todayKey = easternDateKey(new Date().toISOString());
+  const sorted = [...schedule].sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+  return sorted.find((event) => event.type === "game" && easternDateKey(event.start) === todayKey);
+}
+
+function nextScheduledGame(schedule: SeasonEvent[]) {
+  const todayKey = easternDateKey(new Date().toISOString());
+  const sorted = [...schedule].sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+  return (
+    sorted.find((event) => event.type === "game" && easternDateKey(event.start) >= todayKey) ??
+    sorted.find((event) => easternDateKey(event.start) >= todayKey)
+  );
+}
+
+function eventStatusLabel(status: ScheduleStatus) {
+  if (status === "in_progress") return "Current";
+  if (status === "today") return "Today";
+  if (status === "completed") return "Saved";
+  if (status === "past") return "Past";
+  return "Future";
+}
+
+function easternDateKey(start: string) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(start));
+  const year = parts.find((part) => part.type === "year")?.value ?? "0000";
+  const month = parts.find((part) => part.type === "month")?.value ?? "01";
+  const day = parts.find((part) => part.type === "day")?.value ?? "01";
+  return `${year}-${month}-${day}`;
 }
 
 function defaultGameFlow(event?: SeasonEvent): GameFlow {
