@@ -22,6 +22,26 @@ export type PitchTracker = {
   history: PitchTrackerSnapshot[];
 };
 
+export type GameHalf = "top" | "bottom";
+
+export type GameFlowSnapshot = {
+  inning: number;
+  half: GameHalf;
+  outs: number;
+  runsThisHalf: number;
+  ourRuns: number;
+  theirRuns: number;
+  battersThisHalf: number;
+  currentBatterIndex: number;
+  status: "pregame" | "live" | "final";
+  battingHalf: GameHalf;
+  notice?: string;
+};
+
+export type GameFlow = GameFlowSnapshot & {
+  history: GameFlowSnapshot[];
+};
+
 export type GameRecord = {
   id: string;
   date: string;
@@ -49,6 +69,7 @@ export type SharedGameState = {
   pitchLog: PitchLog;
   pitchTracker: PitchTracker;
   pitchQueue: string[];
+  gameFlow: GameFlow;
   battingOrder: string[];
   seasonSchedule: SeasonEvent[];
   activeEventId?: string;

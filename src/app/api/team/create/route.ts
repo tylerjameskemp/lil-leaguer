@@ -29,6 +29,9 @@ export async function POST(request: Request) {
 
   const players = body.state?.players?.length ? body.state.players : DEFAULT_PLAYERS;
   const seasonSchedule = mergeSeasonSchedule(body.state?.seasonSchedule);
+  const activeEventId = body.state?.activeEventId ?? defaultActiveGameId(seasonSchedule);
+  const activeEvent = seasonSchedule.find((event) => event.id === activeEventId);
+  const battingHalf = activeEvent?.homeAway === "home" ? "bottom" : "top";
   const initialState: SharedGameState = {
     players,
     pitchLog: body.state?.pitchLog ?? {},
@@ -40,9 +43,22 @@ export async function POST(request: Request) {
       history: [],
     },
     pitchQueue: body.state?.pitchQueue ?? players.filter((player) => player.wants.includes("P")).map((player) => player.id),
+    gameFlow: body.state?.gameFlow ?? {
+      inning: 1,
+      half: "top",
+      outs: 0,
+      runsThisHalf: 0,
+      ourRuns: 0,
+      theirRuns: 0,
+      battersThisHalf: 0,
+      currentBatterIndex: 0,
+      status: "pregame",
+      battingHalf,
+      history: [],
+    },
     battingOrder: body.state?.battingOrder ?? generateBattingOrder(players, body.state?.seasonStats ?? {}),
     seasonSchedule,
-    activeEventId: body.state?.activeEventId ?? defaultActiveGameId(seasonSchedule),
+    activeEventId,
     seasonStats: body.state?.seasonStats ?? {},
     gameHistory: body.state?.gameHistory ?? [],
     gamePlan: body.state?.gamePlan ?? generateAssignments(players, body.state?.seasonStats ?? {}),

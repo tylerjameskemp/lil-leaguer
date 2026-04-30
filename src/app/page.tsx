@@ -18,6 +18,9 @@ import {
 } from "@/lib/rotation";
 import { defaultActiveGameId, mergeSeasonSchedule } from "@/lib/season";
 import type {
+  GameFlow,
+  GameFlowSnapshot,
+  GameHalf,
   GameRecord,
   PitchLog,
   PitchTracker,
@@ -27,11 +30,12 @@ import type {
   TeamSession,
 } from "@/lib/shared-game";
 
-type Tab = "game" | "batting" | "setup" | "pitch" | "season";
+type Tab = "field" | "batting" | "pitch" | "roster" | "season";
 type StoredState = {
   players?: Player[];
   pitchLog?: PitchLog;
   pitchTracker?: PitchTracker;
+  gameFlow?: GameFlow;
   pitchQueue?: string[];
   battingOrder?: string[];
   seasonSchedule?: SeasonEvent[];
@@ -67,10 +71,15 @@ export default function Home() {
   const migratedStarterRoster = hasOldStarterRoster(stored.players);
   const initialPlayers = normalizeStoredPlayers(stored.players);
   const initialSchedule = mergeSeasonSchedule(stored.seasonSchedule);
+  const initialActiveEventId = stored.activeEventId ?? defaultActiveGameId(initialSchedule);
+  const initialSeasonEvent = initialSchedule.find((event) => event.id === initialActiveEventId);
   const [players, setPlayers] = useState<Player[]>(() => initialPlayers);
   const [pitchLog, setPitchLog] = useState<PitchLog>(() => (migratedStarterRoster ? {} : stored.pitchLog ?? {}));
   const [pitchTracker, setPitchTracker] = useState<PitchTracker>(() =>
     migratedStarterRoster ? emptyPitchTracker() : normalizePitchTracker(stored.pitchTracker),
+  );
+  const [gameFlow, setGameFlow] = useState<GameFlow>(() =>
+    migratedStarterRoster ? defaultGameFlow(initialSeasonEvent) : normalizeGameFlow(stored.gameFlow, initialSeasonEvent),
   );
   const [pitchQueue, setPitchQueue] = useState<string[]>(() => (migratedStarterRoster ? [] : stored.pitchQueue ?? []));
   const [seasonStats, setSeasonStats] = useState<SeasonStats>(() =>
@@ -86,16 +95,16 @@ export default function Home() {
   );
   const [seasonSchedule, setSeasonSchedule] = useState<SeasonEvent[]>(() => initialSchedule);
   const [activeEventId, setActiveEventId] = useState<string | undefined>(
-    () => stored.activeEventId ?? defaultActiveGameId(initialSchedule),
+    () => initialActiveEventId,
   );
   const [gamePlan, setGamePlan] = useState<Assignment[]>(
     () =>
       (migratedStarterRoster ? undefined : stored.gamePlan) ??
       generateAssignments(initialPlayers, migratedStarterRoster ? {} : stored.seasonStats ?? {}),
   );
-  const [activeInning, setActiveInning] = useState(1);
   const [inningsPlayed, setInningsPlayed] = useState(() => stored.inningsPlayed ?? 4);
-  const [activeTab, setActiveTab] = useState<Tab>("game");
+  const [activeTab, setActiveTab] = useState<Tab>("field");
+  const [menuOpen, setMenuOpen] = useState(false);
   const [teamSession, setTeamSession] = useState<TeamSession | undefined>(() => stored.teamSession);
   const [syncStatus, setSyncStatus] = useState<"local" | "live" | "saving" | "offline" | "conflict">(
     () => (stored.teamSession ? "live" : "local"),
@@ -117,6 +126,7 @@ export default function Home() {
         players,
         pitchLog,
         pitchTracker,
+        gameFlow,
         pitchQueue,
         battingOrder,
         seasonSchedule,
@@ -132,6 +142,7 @@ export default function Home() {
     players,
     pitchLog,
     pitchTracker,
+    gameFlow,
     pitchQueue,
     battingOrder,
     seasonSchedule,
@@ -145,16 +156,26 @@ export default function Home() {
 
   const innings = gamePlan.filter((assignment) => assignment.inning > 0);
   const compliance = gamePlan.find((assignment) => assignment.inning === 0)?.notes ?? [];
+  const activeInning = gameFlow.inning;
   const activeAssignment = innings.find((assignment) => assignment.inning === activeInning) ?? innings[0];
   const presentPlayers = players.filter((player) => player.present);
   const presentCount = presentPlayers.length;
-  const benchPerInning = Math.max(0, presentCount - POSITIONS.length);
-  const visibleInnings = innings.slice(0, inningsPlayed);
+  const activeSeasonEvent = useMemo(
+    () => seasonSchedule.find((event) => event.id === activeEventId),
+    [seasonSchedule, activeEventId],
+  );
+  const battingHalf = gameFlow.battingHalf ?? inferBattingHalf(activeSeasonEvent);
+  const isOurBattingHalf = gameFlow.half === battingHalf;
+  const completedFieldInnings = completedDefensiveInningCount(gameFlow, battingHalf);
+  const visibleInnings = innings.slice(0, completedFieldInnings);
   const pitcherInnings = useMemo(() => getPitcherInnings(innings), [innings]);
   const pitcherQueuePlayers = useMemo(
     () => pitchQueue.map((id) => players.find((player) => player.id === id)).filter(Boolean) as Player[],
     [pitchQueue, players],
   );
+  const activePitcher =
+    players.find((player) => player.id === pitchTracker.pitcherId) ?? pitcherQueuePlayers[0];
+  const activePitchCount = activePitcher ? pitchLog[activePitcher.id] ?? 0 : 0;
   const battingOrderPlayers = useMemo(() => {
     const presentIds = new Set(presentPlayers.map((player) => player.id));
     const ordered = battingOrder
@@ -168,15 +189,12 @@ export default function Home() {
     () => summarizeGame(players, visibleInnings, pitchLog, battingOrderPlayers),
     [players, visibleInnings, pitchLog, battingOrderPlayers],
   );
-  const activeSeasonEvent = useMemo(
-    () => seasonSchedule.find((event) => event.id === activeEventId),
-    [seasonSchedule, activeEventId],
-  );
   const sharedGameState = useMemo<SharedGameState>(
     () => ({
       players,
       pitchLog,
       pitchTracker,
+      gameFlow,
       pitchQueue,
       battingOrder: battingOrderPlayers.map((player) => player.id),
       seasonSchedule,
@@ -184,12 +202,13 @@ export default function Home() {
       seasonStats,
       gameHistory,
       gamePlan,
-      inningsPlayed,
+      inningsPlayed: completedFieldInnings,
     }),
     [
       players,
       pitchLog,
       pitchTracker,
+      gameFlow,
       pitchQueue,
       battingOrderPlayers,
       seasonSchedule,
@@ -197,7 +216,7 @@ export default function Home() {
       seasonStats,
       gameHistory,
       gamePlan,
-      inningsPlayed,
+      completedFieldInnings,
     ],
   );
 
@@ -217,9 +236,12 @@ export default function Home() {
     const migratedStarterRoster = hasOldStarterRoster(state.players);
     const nextPlayers = normalizeStoredPlayers(state.players);
     const nextSchedule = mergeSeasonSchedule(state.seasonSchedule);
+    const nextActiveEventId = state.activeEventId ?? defaultActiveGameId(nextSchedule);
+    const nextSeasonEvent = nextSchedule.find((event) => event.id === nextActiveEventId);
     setPlayers(nextPlayers);
     setPitchLog(migratedStarterRoster ? {} : state.pitchLog);
     setPitchTracker(migratedStarterRoster ? emptyPitchTracker() : normalizePitchTracker(state.pitchTracker));
+    setGameFlow(migratedStarterRoster ? defaultGameFlow(nextSeasonEvent) : normalizeGameFlow(state.gameFlow, nextSeasonEvent));
     setPitchQueue(migratedStarterRoster ? [] : state.pitchQueue);
     setBattingOrder(
       migratedStarterRoster
@@ -227,7 +249,7 @@ export default function Home() {
         : state.battingOrder ?? generateBattingOrder(nextPlayers, state.seasonStats),
     );
     setSeasonSchedule(nextSchedule);
-    setActiveEventId(state.activeEventId ?? defaultActiveGameId(nextSchedule));
+    setActiveEventId(nextActiveEventId);
     setSeasonStats(migratedStarterRoster ? {} : state.seasonStats);
     setGameHistory(migratedStarterRoster ? [] : state.gameHistory);
     setGamePlan(migratedStarterRoster ? generateAssignments(nextPlayers, {}) : state.gamePlan);
@@ -432,7 +454,7 @@ export default function Home() {
       lastSyncedStateRef.current = JSON.stringify(payload.game.state);
       setSyncStatus("live");
       setSyncMessage("Joined shared game.");
-      setActiveTab("game");
+      setActiveTab("field");
     } catch (error) {
       setSyncStatus("offline");
       setSyncMessage(String(error));
@@ -443,20 +465,125 @@ export default function Home() {
     const nextPlan = generateAssignments(players, seasonStats);
     setGamePlan(nextPlan);
     setBattingOrder(generateBattingOrder(players, seasonStats));
-    setActiveInning(1);
-    setActiveTab("game");
-  }
-
-  function regenerateDefensePlan() {
-    const nextPlan = generateAssignments(players, seasonStats);
-    setGamePlan(nextPlan);
-    setActiveInning(1);
-    setActiveTab("game");
+    setGameFlow(defaultGameFlow(activeSeasonEvent));
+    setPitchTracker(emptyPitchTracker());
+    setPitchLog({});
+    setActiveTab("field");
   }
 
   function regenerateBattingOrder() {
     setBattingOrder(generateBattingOrder(players, seasonStats));
     setActiveTab("batting");
+  }
+
+  function updateGameFlow(
+    updater: (current: GameFlow) => GameFlow,
+    preferredTab?: Tab,
+  ) {
+    setGameFlow((current) => {
+      const snapshot = snapshotGameFlow(current);
+      const next = updater(current);
+      return {
+        ...next,
+        status: next.status === "final" ? "final" : "live",
+        history: [...current.history, snapshot].slice(-30),
+      };
+    });
+    if (preferredTab) setActiveTab(preferredTab);
+  }
+
+  function recordRun(side: "ours" | "theirs" | "auto" = "auto") {
+    updateGameFlow((current) => {
+      const scoringSide = side === "auto" ? (current.half === current.battingHalf ? "ours" : "theirs") : side;
+      const runsThisHalf = current.runsThisHalf + 1;
+      return {
+        ...current,
+        runsThisHalf,
+        ourRuns: current.ourRuns + (scoringSide === "ours" ? 1 : 0),
+        theirRuns: current.theirRuns + (scoringSide === "theirs" ? 1 : 0),
+        notice:
+          runsThisHalf >= AAA_RULES.maxRunsPerInning
+            ? "Five-run limit reached. Switch sides when ready."
+            : "Run added.",
+      };
+    });
+  }
+
+  function recordOut() {
+    updateGameFlow((current) => {
+      const outs = Math.min(3, current.outs + 1);
+      return {
+        ...current,
+        outs,
+        notice: outs >= 3 ? "Three outs. Switch sides when ready." : "Out added.",
+      };
+    });
+  }
+
+  function advanceBatter() {
+    updateGameFlow((current) => {
+      const lineupSize = Math.max(1, battingOrderPlayers.length);
+      const battersThisHalf = current.battersThisHalf + 1;
+      return {
+        ...current,
+        battersThisHalf,
+        currentBatterIndex: (current.currentBatterIndex + 1) % lineupSize,
+        notice:
+          battersThisHalf >= lineupSize
+            ? "Batted through the lineup. Switch sides when ready."
+            : "Next batter.",
+      };
+    }, "batting");
+  }
+
+  function nextHalfInning() {
+    const current = gameFlow;
+    const nextHalf: GameHalf = current.half === "top" ? "bottom" : "top";
+    const nextInning = current.half === "bottom" ? Math.min(AAA_RULES.innings, current.inning + 1) : current.inning;
+    const nextFlow: GameFlow = {
+      ...current,
+      inning: nextInning,
+      half: nextHalf,
+      outs: 0,
+      runsThisHalf: 0,
+      battersThisHalf: 0,
+      notice: `${halfLabel(nextHalf)} ${nextInning}.`,
+      history: [...current.history, snapshotGameFlow(current)].slice(-30),
+      status: "live",
+    };
+    setGameFlow(nextFlow);
+    setPitchTracker((tracker) => ({
+      ...tracker,
+      balls: 0,
+      strikes: 0,
+      outs: 0,
+      coachPitch: false,
+      notice: "New half-inning.",
+    }));
+    setActiveTab(nextHalf === battingHalf ? "batting" : "field");
+  }
+
+  function undoGameFlow() {
+    setGameFlow((current) => {
+      const previous = current.history[current.history.length - 1];
+      if (!previous) return current;
+      return {
+        ...previous,
+        history: current.history.slice(0, -1),
+        notice: "Undid last game action.",
+      };
+    });
+  }
+
+  function toggleBattingHalf() {
+    updateGameFlow((current) => {
+      const battingHalf = current.battingHalf === "top" ? "bottom" : "top";
+      return {
+        ...current,
+        battingHalf,
+        notice: `Clam Bar bats ${halfLabel(battingHalf).toLowerCase()}.`,
+      };
+    });
   }
 
   function updatePlayer(id: string, patch: Partial<Player>) {
@@ -553,6 +680,9 @@ export default function Home() {
 
   function saveGameToSeason() {
     const savedEvent = activeSeasonEvent;
+    const inningsCompleted = Math.max(1, completedFieldInnings);
+    const nextEventId = nextGameIdAfter(seasonSchedule, savedEvent?.id);
+    const nextEvent = seasonSchedule.find((event) => event.id === nextEventId);
     setSeasonStats((current) => mergeSeasonStats(current, gameSummary));
     setGameHistory((current) => [
       {
@@ -560,7 +690,7 @@ export default function Home() {
         date: savedEvent ? formatEventDate(savedEvent.start) : new Date().toLocaleDateString(),
         title: savedEvent?.title,
         scheduleEventId: savedEvent?.id,
-        inningsPlayed,
+        inningsPlayed: inningsCompleted,
         playerCount: presentCount,
         stats: gameSummary,
       },
@@ -568,13 +698,24 @@ export default function Home() {
     ]);
     setPitchLog({});
     setPitchTracker(emptyPitchTracker());
-    setActiveEventId(nextGameIdAfter(seasonSchedule, savedEvent?.id));
+    setGameFlow(defaultGameFlow(nextEvent));
+    setActiveEventId(nextEventId);
     setActiveTab("season");
   }
 
   function resetSeason() {
     setSeasonStats({});
     setGameHistory([]);
+  }
+
+  function selectSeasonEvent(eventId: string) {
+    const event = seasonSchedule.find((candidate) => candidate.id === eventId);
+    setActiveEventId(eventId);
+    setGameFlow((current) => ({
+      ...current,
+      battingHalf: inferBattingHalf(event),
+      notice: event ? `Selected ${event.title}.` : current.notice,
+    }));
   }
 
   function addPitcher(playerId: string) {
@@ -624,13 +765,46 @@ export default function Home() {
               </p>
               <h1 className="text-2xl font-bold tracking-normal">Lil Leaguer</h1>
             </div>
-            <SyncBadge syncStatus={syncStatus} teamSession={teamSession} message={syncMessage} />
+            <div className="relative flex items-center gap-2">
+              <SyncBadge syncStatus={syncStatus} teamSession={teamSession} message={syncMessage} />
+              <button
+                className="flex h-11 w-11 flex-col items-center justify-center gap-1 rounded-md border border-[#d8d2c4] bg-white shadow-sm"
+                type="button"
+                aria-label="Open menu"
+                aria-expanded={menuOpen}
+                onClick={() => setMenuOpen((open) => !open)}
+              >
+                <span className="h-0.5 w-5 rounded bg-[#17211f]" />
+                <span className="h-0.5 w-5 rounded bg-[#17211f]" />
+                <span className="h-0.5 w-5 rounded bg-[#17211f]" />
+              </button>
+              {menuOpen ? (
+                <div className="absolute right-0 top-12 z-40 w-56 rounded-lg border border-[#d8d2c4] bg-white p-2 text-sm shadow-lg">
+                  <button
+                    className={`w-full rounded-md px-3 py-3 text-left font-semibold ${
+                      activeTab === "season" ? "bg-[#e8f3f0] text-[#176a5f]" : "hover:bg-[#fbfaf5]"
+                    }`}
+                    type="button"
+                    onClick={() => {
+                      setActiveTab("season");
+                      setMenuOpen(false);
+                    }}
+                  >
+                    Season
+                    <span className="mt-0.5 block text-xs font-normal text-[#66716d]">
+                      Schedule, saved games, fairness totals
+                    </span>
+                  </button>
+                </div>
+              ) : null}
+            </div>
           </div>
 
-          <div className="mt-3 grid grid-cols-3 gap-2 text-center">
-            <Metric label="Present" value={`${presentCount}/${players.length}`} />
-            <Metric label="Bench" value={`${benchPerInning}/inn`} />
-            <Metric label="Played" value={`${inningsPlayed} inn`} />
+          <div className="mt-3 grid grid-cols-4 gap-1.5 text-center">
+            <Metric label="Inning" value={`${halfLabel(gameFlow.half)} ${gameFlow.inning}`} />
+            <Metric label="Score" value={`${gameFlow.ourRuns}-${gameFlow.theirRuns}`} />
+            <Metric label="Outs" value={`${gameFlow.outs}`} />
+            <Metric label="P" value={activePitcher ? `${activePitcher.name} ${activePitchCount}` : "-"} />
           </div>
         </div>
       </header>
@@ -649,23 +823,30 @@ export default function Home() {
           />
         ) : null}
 
-        {activeTab === "game" ? (
+        <GameControl
+          battingHalf={battingHalf}
+          gameFlow={gameFlow}
+          isOurBattingHalf={isOurBattingHalf}
+          lineupSize={battingOrderPlayers.length}
+          onNextHalf={nextHalfInning}
+          onOut={() => recordOut()}
+          onRun={() => recordRun("auto")}
+          onToggleBattingHalf={toggleBattingHalf}
+          onUndo={undoGameFlow}
+        />
+
+        {activeTab === "field" ? (
           <GameTab
             activeAssignment={activeAssignment}
             activeInning={activeInning}
             compliance={compliance}
-            innings={innings}
-            inningsPlayed={inningsPlayed}
             pitchLog={pitchLog}
             pitcherInnings={pitcherInnings}
             pitcherQueue={pitcherQueuePlayers}
             players={players}
             seasonEvent={activeSeasonEvent}
-            setActiveInning={setActiveInning}
-            setInningsPlayed={setInningsPlayed}
             onAssign={assignPosition}
             onBench={benchPlayer}
-            onGenerateDefense={regenerateDefensePlan}
             onSave={saveGameToSeason}
           />
         ) : null}
@@ -673,14 +854,18 @@ export default function Home() {
         {activeTab === "batting" ? (
           <BattingTab
             battingOrder={battingOrderPlayers}
+            gameFlow={gameFlow}
             seasonStats={seasonStats}
             onGenerate={regenerateBattingOrder}
+            onNextBatter={advanceBatter}
+            onOut={() => recordOut()}
+            onRun={() => recordRun("ours")}
             onMove={moveBatter}
           />
         ) : null}
 
-        {activeTab === "setup" ? (
-          <SetupTab
+        {activeTab === "roster" ? (
+          <RosterTab
             players={players}
             onAdd={addPlayer}
             onChange={updatePlayer}
@@ -691,6 +876,7 @@ export default function Home() {
 
         {activeTab === "pitch" ? (
           <PitchTab
+            gameFlow={gameFlow}
             players={players}
             pitchLog={pitchLog}
             pitchTracker={pitchTracker}
@@ -699,6 +885,8 @@ export default function Home() {
             setPitchLog={setPitchLog}
             setPitchTracker={setPitchTracker}
             onAddPitcher={addPitcher}
+            onOut={() => recordOut()}
+            onRunAllowed={() => recordRun("theirs")}
             onMovePitcher={movePitcher}
             onRemovePitcher={removePitcher}
           />
@@ -713,21 +901,98 @@ export default function Home() {
             schedule={seasonSchedule}
             seasonStats={seasonStats}
             onReset={resetSeason}
-            onSelectEvent={setActiveEventId}
+            onSelectEvent={selectSeasonEvent}
           />
         ) : null}
       </div>
 
       <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-[#d8d2c4] bg-[#fbfaf5]/95 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-2 backdrop-blur">
-        <div className="mx-auto grid max-w-5xl grid-cols-5 gap-1.5">
-          <TabButton active={activeTab === "game"} label="Game" onClick={() => setActiveTab("game")} />
+        <div className="mx-auto grid max-w-5xl grid-cols-4 gap-1.5">
+          <TabButton active={activeTab === "field"} label="Field" onClick={() => setActiveTab("field")} />
           <TabButton active={activeTab === "batting"} label="Bat" onClick={() => setActiveTab("batting")} />
-          <TabButton active={activeTab === "setup"} label="Setup" onClick={() => setActiveTab("setup")} />
           <TabButton active={activeTab === "pitch"} label="Pitch" onClick={() => setActiveTab("pitch")} />
-          <TabButton active={activeTab === "season"} label="Season" onClick={() => setActiveTab("season")} />
+          <TabButton active={activeTab === "roster"} label="Roster" onClick={() => setActiveTab("roster")} />
         </div>
       </nav>
     </main>
+  );
+}
+
+function GameControl({
+  battingHalf,
+  gameFlow,
+  isOurBattingHalf,
+  lineupSize,
+  onNextHalf,
+  onOut,
+  onRun,
+  onToggleBattingHalf,
+  onUndo,
+}: {
+  battingHalf: GameHalf;
+  gameFlow: GameFlow;
+  isOurBattingHalf: boolean;
+  lineupSize: number;
+  onNextHalf: () => void;
+  onOut: () => void;
+  onRun: () => void;
+  onToggleBattingHalf: () => void;
+  onUndo: () => void;
+}) {
+  const limitNotice = halfInningNotice(gameFlow, lineupSize);
+
+  return (
+    <section className="mb-4 rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold">
+            {halfLabel(gameFlow.half)} {gameFlow.inning}
+          </h2>
+          <p className="text-sm text-[#66716d]">
+            {isOurBattingHalf ? "Clam Bar batting" : "Clam Bar fielding"} · bats {halfLabel(battingHalf).toLowerCase()}
+          </p>
+        </div>
+        <button
+          className="h-10 rounded-md border border-[#d8d2c4] px-3 text-sm font-semibold"
+          onClick={onToggleBattingHalf}
+          type="button"
+        >
+          Bat {halfLabel(battingHalf)}
+        </button>
+      </div>
+
+      <div className="mt-3 grid grid-cols-4 gap-2 text-center">
+        <MiniStat label="Score" value={`${gameFlow.ourRuns}-${gameFlow.theirRuns}`} />
+        <MiniStat label="Outs" value={`${gameFlow.outs}/3`} />
+        <MiniStat label="Runs" value={`${gameFlow.runsThisHalf}/5`} />
+        <MiniStat label="Batters" value={`${gameFlow.battersThisHalf}`} />
+      </div>
+
+      {limitNotice || gameFlow.notice ? (
+        <div className="mt-3 rounded-md border border-[#e6c08b] bg-[#fff8e9] px-3 py-2 text-sm font-semibold text-[#5f5541]">
+          {limitNotice ?? gameFlow.notice}
+        </div>
+      ) : null}
+
+      <div className="mt-3 grid grid-cols-4 gap-2">
+        <button className="h-11 rounded-md bg-[#176a5f] text-sm font-bold text-white" onClick={onRun}>
+          Run +1
+        </button>
+        <button className="h-11 rounded-md bg-[#176a5f] text-sm font-bold text-white" onClick={onOut}>
+          Out +1
+        </button>
+        <button
+          className="h-11 rounded-md border border-[#d8d2c4] text-sm font-semibold disabled:text-[#b6b0a4]"
+          disabled={!gameFlow.history.length}
+          onClick={onUndo}
+        >
+          Undo
+        </button>
+        <button className="h-11 rounded-md border border-[#d8d2c4] text-sm font-semibold" onClick={onNextHalf}>
+          Next Half
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -844,35 +1109,25 @@ function GameTab({
   activeAssignment,
   activeInning,
   compliance,
-  innings,
-  inningsPlayed,
   pitchLog,
   pitcherInnings,
   pitcherQueue,
   players,
   seasonEvent,
-  setActiveInning,
-  setInningsPlayed,
   onAssign,
   onBench,
-  onGenerateDefense,
   onSave,
 }: {
   activeAssignment?: Assignment;
   activeInning: number;
   compliance: string[];
-  innings: Assignment[];
-  inningsPlayed: number;
   pitchLog: PitchLog;
   pitcherInnings: Record<string, number[]>;
   pitcherQueue: Player[];
   players: Player[];
   seasonEvent?: SeasonEvent;
-  setActiveInning: (inning: number) => void;
-  setInningsPlayed: (innings: number) => void;
   onAssign: (inning: number, position: Position, playerId: string) => void;
   onBench: (inning: number, playerId: string) => void;
-  onGenerateDefense: () => void;
   onSave: () => void;
 }) {
   const presentPlayers = players.filter((player) => player.present);
@@ -883,7 +1138,7 @@ function GameTab({
       <div className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <h2 className="text-lg font-semibold">Current Inning</h2>
+            <h2 className="text-lg font-semibold">Field Positions</h2>
             <p className="text-sm text-[#66716d]">
               {seasonEvent ? seasonEvent.title : "Tap names to swap. Pitchers cannot re-enter later."}
             </p>
@@ -893,46 +1148,10 @@ function GameTab({
               </p>
             ) : null}
           </div>
-          <div className="grid grid-cols-[1fr_auto] items-end gap-2 sm:flex">
-            <button
-              className="h-10 rounded-md border border-[#d8d2c4] bg-[#fbfaf5] px-3 text-sm font-bold text-[#176a5f]"
-              onClick={onGenerateDefense}
-            >
-              Rebuild positions
-            </button>
-            <label className="text-right text-xs font-bold uppercase tracking-[0.1em] text-[#66716d]">
-              Played
-              <select
-                className="mt-1 block h-10 rounded-md border border-[#d8d2c4] bg-white px-2 text-base font-semibold normal-case tracking-normal text-[#17211f]"
-                value={inningsPlayed}
-                onChange={(event) => setInningsPlayed(Number(event.target.value))}
-              >
-                {innings.map((assignment) => (
-                  <option key={assignment.inning} value={assignment.inning}>
-                    {assignment.inning}
-                  </option>
-                ))}
-              </select>
-            </label>
+          <div className="rounded-md bg-[#fbfaf5] px-3 py-2 text-right">
+            <div className="text-xs font-bold uppercase tracking-[0.1em] text-[#66716d]">Inning</div>
+            <div className="text-lg font-bold">{activeInning}</div>
           </div>
-        </div>
-
-        <div className="mt-3 grid grid-cols-6 gap-1.5">
-          {innings.map((assignment) => (
-            <button
-              key={assignment.inning}
-              className={`h-11 rounded-md border text-sm font-bold transition ${
-                activeInning === assignment.inning
-                  ? "border-[#176a5f] bg-[#176a5f] text-white"
-                  : assignment.inning <= inningsPlayed
-                    ? "border-[#9bc6bc] bg-[#e8f3f0] text-[#176a5f]"
-                    : "border-[#d8d2c4] bg-[#fbfaf5]"
-              }`}
-              onClick={() => setActiveInning(assignment.inning)}
-            >
-              {assignment.inning}
-            </button>
-          ))}
         </div>
       </div>
 
@@ -985,8 +1204,8 @@ function GameTab({
           {nextPitcher ? `Next queued pitcher: ${nextPitcher.name}` : "Short-game fairness"}
         </p>
         <p className="mt-1 text-[#5f5541]">
-          If the game ends after 4 innings, set Played to 4 before saving. Only those innings count
-          toward season field and bench totals.
+          Defensive rotation is generated from Roster before the game. During play, make simple
+          swaps here and use Next Half to move the game forward.
         </p>
       </div>
 
@@ -1069,16 +1288,25 @@ function PositionRow({
 
 function BattingTab({
   battingOrder,
+  gameFlow,
   seasonStats,
   onGenerate,
+  onNextBatter,
+  onOut,
+  onRun,
   onMove,
 }: {
   battingOrder: Player[];
+  gameFlow: GameFlow;
   seasonStats: SeasonStats;
   onGenerate: () => void;
+  onNextBatter: () => void;
+  onOut: () => void;
+  onRun: () => void;
   onMove: (playerId: string, direction: -1 | 1) => void;
 }) {
   const bottomThirdStart = Math.floor((Math.max(battingOrder.length, 1) * 2) / 3) + 1;
+  const currentBatter = battingOrder[gameFlow.currentBatterIndex % Math.max(1, battingOrder.length)];
 
   return (
     <section className="space-y-4">
@@ -1087,7 +1315,7 @@ function BattingTab({
           <div>
             <h2 className="text-lg font-semibold">Batting Lineup</h2>
             <p className="text-sm text-[#66716d]">
-              Earlier slots are more likely to get an extra at-bat in short games.
+              Current batter: {currentBatter?.name ?? "Set lineup"}
             </p>
           </div>
           <button
@@ -1099,11 +1327,20 @@ function BattingTab({
         </div>
       </div>
 
-      <div className="rounded-lg border border-[#e6c08b] bg-[#fff8e9] p-3 text-sm leading-6">
-        <p className="font-semibold">How fairness works</p>
-        <p className="mt-1 text-[#5f5541]">
-          When you save a game, Lil Leaguer records each player&apos;s lineup slot. Kids who have
-          spent more games near the bottom get pulled toward the top next time.
+      <div className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
+        <div className="grid grid-cols-3 gap-2">
+          <button className="h-12 rounded-md bg-[#176a5f] text-sm font-bold text-white" onClick={onRun}>
+            Run +1
+          </button>
+          <button className="h-12 rounded-md bg-[#176a5f] text-sm font-bold text-white" onClick={onOut}>
+            Out +1
+          </button>
+          <button className="h-12 rounded-md border border-[#d8d2c4] text-sm font-semibold" onClick={onNextBatter}>
+            Next Batter
+          </button>
+        </div>
+        <p className="mt-2 text-sm text-[#66716d]">
+          Batters this half: {gameFlow.battersThisHalf}/{battingOrder.length || 1}
         </p>
       </div>
 
@@ -1129,7 +1366,10 @@ function BattingTab({
                     {index + 1}
                   </span>
                   <div className="min-w-0">
-                    <div className="truncate font-semibold">{player.name}</div>
+                    <div className="truncate font-semibold">
+                      {player.name}
+                      {currentBatter?.id === player.id ? " · up" : ""}
+                    </div>
                     <div className="text-xs text-[#66716d]">
                       Avg slot {averageSlot}
                       {stats.bottomThirdGames ? ` · ${stats.bottomThirdGames} bottom-third` : ""}
@@ -1161,7 +1401,7 @@ function BattingTab({
   );
 }
 
-function SetupTab({
+function RosterTab({
   players,
   onAdd,
   onChange,
@@ -1174,11 +1414,13 @@ function SetupTab({
   onToggle: (id: string, field: "wants" | "avoid", position: Position) => void;
   onGenerate: () => void;
 }) {
+  const sortedPlayers = [...players].sort((a, b) => a.name.localeCompare(b.name));
+
   return (
     <section className="space-y-4">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold">Pregame Setup</h2>
+          <h2 className="text-lg font-semibold">Roster</h2>
           <p className="text-sm text-[#66716d]">Mark who is here and capture position asks.</p>
         </div>
         <button
@@ -1190,7 +1432,7 @@ function SetupTab({
       </div>
 
       <div className="space-y-3">
-        {players.map((player) => (
+        {sortedPlayers.map((player) => (
           <PlayerEditor
             key={player.id}
             player={player}
@@ -1204,13 +1446,14 @@ function SetupTab({
         className="h-12 w-full rounded-md bg-[#176a5f] px-4 text-base font-semibold text-white"
         onClick={onGenerate}
       >
-        Generate rotation
+        Build field plan
       </button>
     </section>
   );
 }
 
 function PitchTab({
+  gameFlow,
   players,
   pitchLog,
   pitchTracker,
@@ -1219,9 +1462,12 @@ function PitchTab({
   setPitchLog,
   setPitchTracker,
   onAddPitcher,
+  onOut,
+  onRunAllowed,
   onMovePitcher,
   onRemovePitcher,
 }: {
+  gameFlow: GameFlow;
   players: Player[];
   pitchLog: PitchLog;
   pitchTracker: PitchTracker;
@@ -1230,6 +1476,8 @@ function PitchTab({
   setPitchLog: React.Dispatch<React.SetStateAction<PitchLog>>;
   setPitchTracker: React.Dispatch<React.SetStateAction<PitchTracker>>;
   onAddPitcher: (playerId: string) => void;
+  onOut: () => void;
+  onRunAllowed: () => void;
   onMovePitcher: (playerId: string, direction: -1 | 1) => void;
   onRemovePitcher: (playerId: string) => void;
 }) {
@@ -1259,6 +1507,7 @@ function PitchTab({
     }
 
     const countsAgainstPlayer = !pitchTracker.coachPitch;
+    const createsOut = action === "out" || (action === "strike" && pitchTracker.strikes >= 2);
     setPitchTracker((current) => {
       const snapshot = {
         pitcherId: current.pitcherId ?? pitcherId,
@@ -1278,6 +1527,7 @@ function PitchTab({
         [pitcherId]: Math.max(0, (current[pitcherId] ?? 0) + 1),
       }));
     }
+    if (createsOut) onOut();
   }
 
   function startCoachPitch() {
@@ -1377,7 +1627,7 @@ function PitchTab({
         <div className="mt-3 grid grid-cols-4 gap-2 text-center">
           <MiniStat label="Balls" value={`${pitchTracker.balls}`} />
           <MiniStat label="Strikes" value={`${pitchTracker.strikes}`} />
-          <MiniStat label="Outs" value={`${pitchTracker.outs}`} />
+          <MiniStat label="Outs" value={`${gameFlow.outs}`} />
           <MiniStat label="Pitches" value={`${activePitchCount}`} />
         </div>
 
@@ -1422,10 +1672,18 @@ function PitchTab({
           </button>
           <button
             className="h-11 rounded-md border border-[#d8d2c4] text-sm font-semibold"
+            onClick={onRunAllowed}
+          >
+            Run Allowed
+          </button>
+          <button
+            className="h-11 rounded-md border border-[#d8d2c4] text-sm font-semibold"
             onClick={newBatter}
           >
             New batter
           </button>
+        </div>
+        <div className="mt-2 grid grid-cols-1 gap-2">
           <button
             className="h-11 rounded-md border border-[#d8d2c4] text-sm font-semibold disabled:text-[#b6b0a4]"
             disabled={!pitchTracker.history.length}
@@ -1504,7 +1762,7 @@ function PitchTab({
           </button>
         </div>
         <p className="mt-2 text-xs text-[#66716d]">
-          Mark kids as wanting P on Setup first, then arrange the pitching order here.
+          Mark kids as wanting P on Roster first, then arrange the pitching order here.
         </p>
       </div>
 
@@ -1592,7 +1850,7 @@ function PitchTab({
           })
         ) : (
           <div className="rounded-lg border border-[#d8d2c4] bg-white p-4 text-sm text-[#66716d] shadow-sm">
-            No pitchers queued yet. Use Setup to tap P for interested kids, then add them here.
+            No pitchers queued yet. Use Roster to tap P for interested kids, then add them here.
           </div>
         )}
       </div>
@@ -1751,6 +2009,93 @@ function readStoredState(): StoredState {
   } catch {
     return {};
   }
+}
+
+function defaultGameFlow(event?: SeasonEvent): GameFlow {
+  const battingHalf = inferBattingHalf(event);
+  return {
+    inning: 1,
+    half: "top",
+    outs: 0,
+    runsThisHalf: 0,
+    ourRuns: 0,
+    theirRuns: 0,
+    battersThisHalf: 0,
+    currentBatterIndex: 0,
+    status: "pregame",
+    battingHalf,
+    notice: event ? `Ready for ${event.title}.` : "Ready for game.",
+    history: [],
+  };
+}
+
+function normalizeGameFlow(flow?: GameFlow, event?: SeasonEvent): GameFlow {
+  const fallback = defaultGameFlow(event);
+  if (!flow) return fallback;
+  return {
+    inning: clampNumber(flow.inning, 1, AAA_RULES.innings, fallback.inning),
+    half: flow.half === "bottom" ? "bottom" : "top",
+    outs: clampNumber(flow.outs, 0, 3, 0),
+    runsThisHalf: clampNumber(flow.runsThisHalf, 0, AAA_RULES.maxRunsPerInning, 0),
+    ourRuns: clampNumber(flow.ourRuns, 0, 99, 0),
+    theirRuns: clampNumber(flow.theirRuns, 0, 99, 0),
+    battersThisHalf: clampNumber(flow.battersThisHalf, 0, 99, 0),
+    currentBatterIndex: clampNumber(flow.currentBatterIndex, 0, 99, 0),
+    status: flow.status ?? "pregame",
+    battingHalf: flow.battingHalf === "bottom" ? "bottom" : inferBattingHalf(event),
+    notice: flow.notice,
+    history: Array.isArray(flow.history) ? flow.history.slice(-30) : [],
+  };
+}
+
+function snapshotGameFlow(flow: GameFlow): GameFlowSnapshot {
+  return {
+    inning: flow.inning,
+    half: flow.half,
+    outs: flow.outs,
+    runsThisHalf: flow.runsThisHalf,
+    ourRuns: flow.ourRuns,
+    theirRuns: flow.theirRuns,
+    battersThisHalf: flow.battersThisHalf,
+    currentBatterIndex: flow.currentBatterIndex,
+    status: flow.status,
+    battingHalf: flow.battingHalf,
+    notice: flow.notice,
+  };
+}
+
+function inferBattingHalf(event?: SeasonEvent): GameHalf {
+  return event?.homeAway === "home" ? "bottom" : "top";
+}
+
+function halfLabel(half: GameHalf) {
+  return half === "top" ? "Top" : "Bottom";
+}
+
+function halfInningNotice(flow: GameFlow, lineupSize = 0) {
+  if (flow.outs >= 3) return "Three outs. Switch sides when ready.";
+  if (flow.runsThisHalf >= AAA_RULES.maxRunsPerInning) return "Five-run limit reached. Switch sides when ready.";
+  if (lineupSize > 0 && flow.battersThisHalf >= lineupSize) return "Batted through the lineup. Switch sides when ready.";
+  return undefined;
+}
+
+function completedDefensiveInningCount(flow: GameFlow, battingHalf: GameHalf) {
+  const fieldingHalf = battingHalf === "top" ? "bottom" : "top";
+  const currentHalfIndex = (flow.inning - 1) * 2 + (flow.half === "bottom" ? 1 : 0);
+  let completed = 0;
+  for (let index = 0; index < currentHalfIndex; index += 1) {
+    const half = index % 2 === 0 ? "top" : "bottom";
+    if (half === fieldingHalf) completed += 1;
+  }
+  if (flow.status === "final" || halfInningNotice(flow)) {
+    if (flow.half === fieldingHalf) completed += 1;
+  }
+  return Math.min(AAA_RULES.innings, completed);
+}
+
+function clampNumber(value: number | undefined, min: number, max: number, fallback: number) {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Number(value)));
 }
 
 function emptyPitchTracker(): PitchTracker {
