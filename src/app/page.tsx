@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AAA_RULES,
   DEFAULT_PLAYERS,
@@ -14,31 +15,29 @@ import {
   type Position,
   type SeasonStats,
 } from "@/lib/rotation";
+import type { GameRecord, PitchLog, SharedGameState, TeamSession } from "@/lib/shared-game";
 
-type PitchLog = Record<string, number>;
 type Tab = "game" | "setup" | "pitch" | "season";
-type GameRecord = {
-  id: string;
-  date: string;
-  inningsPlayed: number;
-  playerCount: number;
-  stats: SeasonStats;
-};
 type StoredState = {
   players?: Player[];
   pitchLog?: PitchLog;
+  pitchQueue?: string[];
   seasonStats?: SeasonStats;
   gameHistory?: GameRecord[];
   gamePlan?: Assignment[];
   inningsPlayed?: number;
+  teamSession?: TeamSession;
 };
 
 const STORAGE_KEY = "lil-leaguer-state-v2";
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_PUBLISHABLE_KEY = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
 
 export default function Home() {
   const stored = readStoredState();
   const [players, setPlayers] = useState<Player[]>(() => stored.players ?? DEFAULT_PLAYERS);
   const [pitchLog, setPitchLog] = useState<PitchLog>(() => stored.pitchLog ?? {});
+  const [pitchQueue, setPitchQueue] = useState<string[]>(() => stored.pitchQueue ?? []);
   const [seasonStats, setSeasonStats] = useState<SeasonStats>(() => stored.seasonStats ?? {});
   const [gameHistory, setGameHistory] = useState<GameRecord[]>(() => stored.gameHistory ?? []);
   const [gamePlan, setGamePlan] = useState<Assignment[]>(
@@ -47,13 +46,30 @@ export default function Home() {
   const [activeInning, setActiveInning] = useState(1);
   const [inningsPlayed, setInningsPlayed] = useState(() => stored.inningsPlayed ?? 4);
   const [activeTab, setActiveTab] = useState<Tab>("game");
+  const [teamSession, setTeamSession] = useState<TeamSession | undefined>(() => stored.teamSession);
+  const [syncStatus, setSyncStatus] = useState<"local" | "live" | "saving" | "offline" | "conflict">(
+    () => (stored.teamSession ? "live" : "local"),
+  );
+  const [teamName, setTeamName] = useState("Lil Leaguer Team");
+  const [joinCode, setJoinCode] = useState("");
+  const [syncMessage, setSyncMessage] = useState("");
+  const lastSyncedStateRef = useRef("");
 
   useEffect(() => {
     window.localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ players, pitchLog, seasonStats, gameHistory, gamePlan, inningsPlayed }),
+      JSON.stringify({
+        players,
+        pitchLog,
+        pitchQueue,
+        seasonStats,
+        gameHistory,
+        gamePlan,
+        inningsPlayed,
+        teamSession,
+      }),
     );
-  }, [players, pitchLog, seasonStats, gameHistory, gamePlan, inningsPlayed]);
+  }, [players, pitchLog, pitchQueue, seasonStats, gameHistory, gamePlan, inningsPlayed, teamSession]);
 
   const innings = gamePlan.filter((assignment) => assignment.inning > 0);
   const compliance = gamePlan.find((assignment) => assignment.inning === 0)?.notes ?? [];
@@ -62,10 +78,222 @@ export default function Home() {
   const presentCount = presentPlayers.length;
   const benchPerInning = Math.max(0, presentCount - POSITIONS.length);
   const visibleInnings = innings.slice(0, inningsPlayed);
+  const pitcherInnings = useMemo(() => getPitcherInnings(innings), [innings]);
+  const pitcherQueuePlayers = useMemo(
+    () => pitchQueue.map((id) => players.find((player) => player.id === id)).filter(Boolean) as Player[],
+    [pitchQueue, players],
+  );
   const gameSummary = useMemo(
     () => summarizeGame(players, visibleInnings, pitchLog),
     [players, visibleInnings, pitchLog],
   );
+  const sharedGameState = useMemo<SharedGameState>(
+    () => ({
+      players,
+      pitchLog,
+      pitchQueue,
+      seasonStats,
+      gameHistory,
+      gamePlan,
+      inningsPlayed,
+    }),
+    [players, pitchLog, pitchQueue, seasonStats, gameHistory, gamePlan, inningsPlayed],
+  );
+
+  useEffect(() => {
+    if (!teamSession) return;
+
+    const signature = JSON.stringify(sharedGameState);
+    if (!lastSyncedStateRef.current) {
+      lastSyncedStateRef.current = signature;
+      return;
+    }
+    if (signature === lastSyncedStateRef.current) return;
+
+    const timeout = window.setTimeout(async () => {
+      setSyncStatus("saving");
+      try {
+        const response = await fetch(`/api/game/${teamSession.gameId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ state: sharedGameState, version: teamSession.version }),
+        });
+        const payload = (await response.json()) as {
+          game?: { state: SharedGameState; version: number };
+          error?: string;
+        };
+
+        if (response.status === 409 && payload.game) {
+          applyRemoteState(payload.game.state);
+          setTeamSession((current) =>
+            current ? { ...current, version: payload.game?.version ?? current.version } : current,
+          );
+          lastSyncedStateRef.current = JSON.stringify(payload.game.state);
+          setSyncStatus("conflict");
+          setSyncMessage("Another coach updated first. Pulled their latest game state.");
+          return;
+        }
+
+        if (!response.ok || !payload.game) throw new Error(payload.error ?? "Save failed");
+
+        setTeamSession((current) =>
+          current ? { ...current, version: payload.game?.version ?? current.version } : current,
+        );
+        lastSyncedStateRef.current = JSON.stringify(payload.game.state);
+        setSyncStatus("live");
+        setSyncMessage("Saved.");
+      } catch (error) {
+        setSyncStatus("offline");
+        setSyncMessage(String(error));
+      }
+    }, 700);
+
+    return () => window.clearTimeout(timeout);
+  }, [sharedGameState, teamSession]);
+
+  useEffect(() => {
+    if (!teamSession) return;
+
+    const interval = window.setInterval(async () => {
+      try {
+        const response = await fetch(`/api/game/${teamSession.gameId}`);
+        const payload = (await response.json()) as {
+          game?: { state: SharedGameState; version: number };
+        };
+        if (!payload.game || payload.game.version <= teamSession.version) return;
+
+        applyRemoteState(payload.game.state);
+        setTeamSession((current) =>
+          current ? { ...current, version: payload.game?.version ?? current.version } : current,
+        );
+        lastSyncedStateRef.current = JSON.stringify(payload.game.state);
+        setSyncStatus("live");
+        setSyncMessage("Updated from another coach.");
+      } catch {
+        setSyncStatus("offline");
+      }
+    }, 4000);
+
+    return () => window.clearInterval(interval);
+  }, [teamSession]);
+
+  useEffect(() => {
+    if (!teamSession || !SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) return;
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+    const channel = supabase
+      .channel(`game:${teamSession.gameId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "games",
+          filter: `id=eq.${teamSession.gameId}`,
+        },
+        (payload) => {
+          const next = payload.new as { state?: SharedGameState; version?: number };
+          if (!next.state || !next.version || next.version <= teamSession.version) return;
+          applyRemoteState(next.state);
+          setTeamSession((current) =>
+            current ? { ...current, version: next.version ?? current.version } : current,
+          );
+          lastSyncedStateRef.current = JSON.stringify(next.state);
+          setSyncStatus("live");
+          setSyncMessage("Live update received.");
+        },
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [teamSession]);
+
+  function applyRemoteState(state: SharedGameState) {
+    setPlayers(state.players);
+    setPitchLog(state.pitchLog);
+    setPitchQueue(state.pitchQueue);
+    setSeasonStats(state.seasonStats);
+    setGameHistory(state.gameHistory);
+    setGamePlan(state.gamePlan);
+    setInningsPlayed(state.inningsPlayed);
+  }
+
+  async function createTeam() {
+    setSyncStatus("saving");
+    setSyncMessage("Creating shared team...");
+    try {
+      const response = await fetch("/api/team/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: teamName, state: sharedGameState }),
+      });
+      const payload = (await response.json()) as {
+        team?: { id: string; name: string; shareCode: string };
+        game?: { id: string; state: SharedGameState; version: number };
+        error?: string;
+      };
+      if (!response.ok || !payload.team || !payload.game) throw new Error(payload.error);
+
+      applyRemoteState(payload.game.state);
+      const session = {
+        teamId: payload.team.id,
+        gameId: payload.game.id,
+        teamName: payload.team.name,
+        shareCode: payload.team.shareCode,
+        version: payload.game.version,
+      };
+      setTeamSession(session);
+      lastSyncedStateRef.current = JSON.stringify(payload.game.state);
+      setSyncStatus("live");
+      setSyncMessage(`Share code ${session.shareCode}`);
+    } catch (error) {
+      setSyncStatus("offline");
+      setSyncMessage(String(error));
+    }
+  }
+
+  async function joinTeam() {
+    setSyncStatus("saving");
+    setSyncMessage("Joining shared team...");
+    try {
+      const response = await fetch("/api/team/join", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ shareCode: joinCode }),
+      });
+      const payload = (await response.json()) as {
+        team?: { id: string; name: string; shareCode: string };
+        game?: { id: string; state: SharedGameState; version: number };
+        error?: string;
+      };
+      if (!response.ok || !payload.team || !payload.game) throw new Error(payload.error);
+
+      applyRemoteState(payload.game.state);
+      setTeamSession({
+        teamId: payload.team.id,
+        gameId: payload.game.id,
+        teamName: payload.team.name,
+        shareCode: payload.team.shareCode,
+        version: payload.game.version,
+      });
+      lastSyncedStateRef.current = JSON.stringify(payload.game.state);
+      setSyncStatus("live");
+      setSyncMessage("Joined shared game.");
+      setActiveTab("game");
+    } catch (error) {
+      setSyncStatus("offline");
+      setSyncMessage(String(error));
+    }
+  }
+
+  function leaveTeam() {
+    setTeamSession(undefined);
+    lastSyncedStateRef.current = "";
+    setSyncStatus("local");
+    setSyncMessage("Using this phone only.");
+  }
 
   function regeneratePlan() {
     const nextPlan = generateAssignments(players, seasonStats);
@@ -93,6 +321,14 @@ export default function Home() {
         };
       }),
     );
+
+    if (field === "wants" && position === "P") {
+      setPitchQueue((current) => {
+        const active = players.find((player) => player.id === id)?.wants.includes("P");
+        if (active) return current.filter((playerId) => playerId !== id);
+        return current.includes(id) ? current : [...current, id];
+      });
+    }
   }
 
   function addPlayer() {
@@ -112,6 +348,19 @@ export default function Home() {
         const currentPlayer = assignment.positions[position];
         const positions = { ...assignment.positions };
         const bench = assignment.bench.filter((player) => player.id !== playerId);
+
+        if (
+          position === "P" &&
+          selected &&
+          current.some(
+            (other) =>
+              other.inning > 0 &&
+              other.inning !== inning &&
+              other.positions.P?.id === selected.id,
+          )
+        ) {
+          return assignment;
+        }
 
         if (!selected) {
           if (currentPlayer && !bench.some((player) => player.id === currentPlayer.id)) {
@@ -179,6 +428,30 @@ export default function Home() {
     setGameHistory([]);
   }
 
+  function addPitcher(playerId: string) {
+    if (!playerId) return;
+    setPitchQueue((current) => (current.includes(playerId) ? current : [...current, playerId]));
+    const player = players.find((candidate) => candidate.id === playerId);
+    if (player && !player.wants.includes("P")) {
+      updatePlayer(playerId, { wants: [...player.wants, "P"] });
+    }
+  }
+
+  function movePitcher(playerId: string, direction: -1 | 1) {
+    setPitchQueue((current) => {
+      const index = current.indexOf(playerId);
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= current.length) return current;
+      const next = [...current];
+      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+      return next;
+    });
+  }
+
+  function removePitcher(playerId: string) {
+    setPitchQueue((current) => current.filter((id) => id !== playerId));
+  }
+
   return (
     <main className="min-h-screen bg-[#f6f4ed] text-[#17211f]">
       <header className="sticky top-0 z-20 border-b border-[#d8d2c4] bg-[#fbfaf5]/95 backdrop-blur">
@@ -207,6 +480,19 @@ export default function Home() {
       </header>
 
       <div className="mx-auto max-w-5xl px-4 pb-24 pt-4">
+        <SyncPanel
+          joinCode={joinCode}
+          setJoinCode={setJoinCode}
+          setTeamName={setTeamName}
+          syncMessage={syncMessage}
+          syncStatus={syncStatus}
+          teamName={teamName}
+          teamSession={teamSession}
+          onCreate={createTeam}
+          onJoin={joinTeam}
+          onLeave={leaveTeam}
+        />
+
         {activeTab === "game" ? (
           <GameTab
             activeAssignment={activeAssignment}
@@ -214,6 +500,8 @@ export default function Home() {
             compliance={compliance}
             innings={innings}
             inningsPlayed={inningsPlayed}
+            pitcherInnings={pitcherInnings}
+            pitcherQueue={pitcherQueuePlayers}
             players={players}
             setActiveInning={setActiveInning}
             setInningsPlayed={setInningsPlayed}
@@ -234,7 +522,16 @@ export default function Home() {
         ) : null}
 
         {activeTab === "pitch" ? (
-          <PitchTab players={players} pitchLog={pitchLog} setPitchLog={setPitchLog} />
+          <PitchTab
+            players={players}
+            pitchLog={pitchLog}
+            pitcherInnings={pitcherInnings}
+            pitchQueue={pitcherQueuePlayers}
+            setPitchLog={setPitchLog}
+            onAddPitcher={addPitcher}
+            onMovePitcher={movePitcher}
+            onRemovePitcher={removePitcher}
+          />
         ) : null}
 
         {activeTab === "season" ? (
@@ -260,12 +557,115 @@ export default function Home() {
   );
 }
 
+function SyncPanel({
+  joinCode,
+  setJoinCode,
+  setTeamName,
+  syncMessage,
+  syncStatus,
+  teamName,
+  teamSession,
+  onCreate,
+  onJoin,
+  onLeave,
+}: {
+  joinCode: string;
+  setJoinCode: (code: string) => void;
+  setTeamName: (name: string) => void;
+  syncMessage: string;
+  syncStatus: "local" | "live" | "saving" | "offline" | "conflict";
+  teamName: string;
+  teamSession?: TeamSession;
+  onCreate: () => void;
+  onJoin: () => void;
+  onLeave: () => void;
+}) {
+  if (teamSession) {
+    return (
+      <section className="mb-4 rounded-lg border border-[#9bc6bc] bg-[#e8f3f0] p-3 shadow-sm">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-bold text-[#176a5f]">{teamSession.teamName}</div>
+            <div className="mt-1 text-2xl font-bold tracking-normal text-[#17211f]">
+              {teamSession.shareCode}
+            </div>
+            <p className="mt-1 text-xs font-semibold uppercase tracking-[0.1em] text-[#4d5a55]">
+              {syncStatus === "saving"
+                ? "Saving"
+                : syncStatus === "offline"
+                  ? "Offline"
+                  : syncStatus === "conflict"
+                    ? "Updated"
+                    : "Live sync"}
+            </p>
+            {syncMessage ? <p className="mt-1 text-sm text-[#4d5a55]">{syncMessage}</p> : null}
+          </div>
+          <button
+            className="h-10 rounded-md border border-[#9bc6bc] bg-white px-3 text-sm font-semibold text-[#176a5f]"
+            onClick={onLeave}
+          >
+            Leave
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="mb-4 rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
+      <div>
+        <h2 className="text-lg font-semibold">Share Between Coaches</h2>
+        <p className="text-sm text-[#66716d]">
+          Create a team code or join one so three phones see the same game.
+        </p>
+      </div>
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        <div className="space-y-2">
+          <input
+            className="h-11 w-full rounded-md border border-[#d8d2c4] px-3 text-base font-semibold"
+            value={teamName}
+            onChange={(event) => setTeamName(event.target.value)}
+            placeholder="Team name"
+          />
+          <button
+            className="h-11 w-full rounded-md bg-[#176a5f] px-4 text-sm font-semibold text-white disabled:bg-[#b8c9c4]"
+            disabled={syncStatus === "saving"}
+            onClick={onCreate}
+          >
+            Create team code
+          </button>
+        </div>
+        <div className="space-y-2">
+          <input
+            className="h-11 w-full rounded-md border border-[#d8d2c4] px-3 text-center text-xl font-bold tracking-[0.18em]"
+            inputMode="numeric"
+            maxLength={6}
+            value={joinCode}
+            onChange={(event) => setJoinCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+            placeholder="123456"
+          />
+          <button
+            className="h-11 w-full rounded-md border border-[#d8d2c4] px-4 text-sm font-semibold disabled:text-[#b6b0a4]"
+            disabled={syncStatus === "saving" || joinCode.length < 6}
+            onClick={onJoin}
+          >
+            Join team code
+          </button>
+        </div>
+      </div>
+      {syncMessage ? <p className="mt-2 text-sm text-[#66716d]">{syncMessage}</p> : null}
+    </section>
+  );
+}
+
 function GameTab({
   activeAssignment,
   activeInning,
   compliance,
   innings,
   inningsPlayed,
+  pitcherInnings,
+  pitcherQueue,
   players,
   setActiveInning,
   setInningsPlayed,
@@ -278,6 +678,8 @@ function GameTab({
   compliance: string[];
   innings: Assignment[];
   inningsPlayed: number;
+  pitcherInnings: Record<string, number[]>;
+  pitcherQueue: Player[];
   players: Player[];
   setActiveInning: (inning: number) => void;
   setInningsPlayed: (innings: number) => void;
@@ -286,6 +688,7 @@ function GameTab({
   onSave: () => void;
 }) {
   const presentPlayers = players.filter((player) => player.present);
+  const nextPitcher = pitcherQueue.find((player) => !pitcherInnings[player.id]?.length);
 
   return (
     <section className="space-y-4">
@@ -293,7 +696,9 @@ function GameTab({
         <div className="flex items-center justify-between gap-2">
           <div>
             <h2 className="text-lg font-semibold">Current Inning</h2>
-            <p className="text-sm text-[#66716d]">Tap a player name to swap positions.</p>
+            <p className="text-sm text-[#66716d]">
+              Tap names to swap. Pitchers cannot re-enter later.
+            </p>
           </div>
           <label className="text-right text-xs font-bold uppercase tracking-[0.1em] text-[#66716d]">
             Played
@@ -340,6 +745,7 @@ function GameTab({
                   key={position}
                   playerId={player?.id ?? ""}
                   players={presentPlayers}
+                  pitcherInnings={pitcherInnings}
                   position={position}
                   requested={Boolean(player?.wants.includes(position))}
                   onChange={(playerId) => onAssign(activeInning, position, playerId)}
@@ -372,7 +778,9 @@ function GameTab({
       ) : null}
 
       <div className="rounded-lg border border-[#e6c08b] bg-[#fff8e9] p-3 text-sm leading-6">
-        <p className="font-semibold">Short-game fairness</p>
+        <p className="font-semibold">
+          {nextPitcher ? `Next queued pitcher: ${nextPitcher.name}` : "Short-game fairness"}
+        </p>
         <p className="mt-1 text-[#5f5541]">
           If the game ends after 4 innings, set Played to 4 before saving. Only those innings count
           toward season field and bench totals.
@@ -400,12 +808,14 @@ function GameTab({
 function PositionRow({
   playerId,
   players,
+  pitcherInnings,
   position,
   requested,
   onChange,
 }: {
   playerId: string;
   players: Player[];
+  pitcherInnings: Record<string, number[]>;
   position: Position;
   requested: boolean;
   onChange: (playerId: string) => void;
@@ -422,11 +832,16 @@ function PositionRow({
           onChange={(event) => onChange(event.target.value)}
         >
           <option value="">Open</option>
-          {players.map((player) => (
-            <option key={player.id} value={player.id}>
-              {player.name}
-            </option>
-          ))}
+          {players.map((player) => {
+            const usedInnings = pitcherInnings[player.id] ?? [];
+            const pitcherLocked = position === "P" && usedInnings.length > 0 && player.id !== playerId;
+            return (
+              <option key={player.id} value={player.id} disabled={pitcherLocked}>
+                {player.name}
+                {pitcherLocked ? ` (pitched ${usedInnings.join(", ")})` : ""}
+              </option>
+            );
+          })}
         </select>
         {requested ? <span className="mt-1 block text-xs font-semibold text-[#176a5f]">requested</span> : null}
       </span>
@@ -486,18 +901,33 @@ function SetupTab({
 function PitchTab({
   players,
   pitchLog,
+  pitcherInnings,
+  pitchQueue,
   setPitchLog,
+  onAddPitcher,
+  onMovePitcher,
+  onRemovePitcher,
 }: {
   players: Player[];
   pitchLog: PitchLog;
+  pitcherInnings: Record<string, number[]>;
+  pitchQueue: Player[];
   setPitchLog: React.Dispatch<React.SetStateAction<PitchLog>>;
+  onAddPitcher: (playerId: string) => void;
+  onMovePitcher: (playerId: string, direction: -1 | 1) => void;
+  onRemovePitcher: (playerId: string) => void;
 }) {
+  const [selectedPitcher, setSelectedPitcher] = useState("");
+  const pitcherOptions = players.filter(
+    (player) => player.present && player.wants.includes("P") && !pitchQueue.some((queued) => queued.id === player.id),
+  );
+
   return (
     <section className="space-y-4">
       <div className="flex items-end justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold">Pitch Count</h2>
-          <p className="text-sm text-[#66716d]">Daily max, rest, and catcher lockout.</p>
+          <h2 className="text-lg font-semibold">Pitcher Queue</h2>
+          <p className="text-sm text-[#66716d]">Order the kids who want to pitch.</p>
         </div>
         <button
           className="h-10 rounded-md border border-[#d8d2c4] px-3 text-sm font-semibold"
@@ -507,20 +937,64 @@ function PitchTab({
         </button>
       </div>
 
+      <div className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
+        <div className="grid grid-cols-[1fr_auto] gap-2">
+          <select
+            className="h-11 min-w-0 rounded-md border border-[#d8d2c4] bg-white px-3 text-base font-semibold"
+            value={selectedPitcher}
+            onChange={(event) => setSelectedPitcher(event.target.value)}
+          >
+            <option value="">Add pitcher</option>
+            {pitcherOptions.map((player) => (
+              <option key={player.id} value={player.id}>
+                {player.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="h-11 rounded-md bg-[#176a5f] px-4 text-sm font-semibold text-white disabled:bg-[#b8c9c4]"
+            disabled={!selectedPitcher}
+            onClick={() => {
+              onAddPitcher(selectedPitcher);
+              setSelectedPitcher("");
+            }}
+          >
+            Add
+          </button>
+        </div>
+        <p className="mt-2 text-xs text-[#66716d]">
+          Mark kids as wanting P on Setup first, then arrange the pitching order here.
+        </p>
+      </div>
+
       <div className="space-y-2">
-        {players
-          .filter((player) => player.present)
-          .map((player) => {
+        {pitchQueue.length ? (
+          pitchQueue.map((player, index) => {
             const pitches = pitchLog[player.id] ?? 0;
             const limit = pitchLimitForAge(player.age);
+            const usedInnings = pitcherInnings[player.id] ?? [];
             return (
               <div key={player.id} className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <div className="font-semibold">{player.name}</div>
+                    <div className="flex items-center gap-2">
+                      <span className="flex h-7 w-7 items-center justify-center rounded-md bg-[#fbfaf5] text-sm font-bold text-[#9b3d2e]">
+                        {index + 1}
+                      </span>
+                      <div className="font-semibold">{player.name}</div>
+                    </div>
                     <div className="text-sm text-[#66716d]">
                       Age {player.age} max {limit}
                     </div>
+                    {usedInnings.length ? (
+                      <div className="mt-1 text-xs font-semibold text-[#9b3d2e]">
+                        Used inning {usedInnings.join(", ")}; cannot re-enter
+                      </div>
+                    ) : (
+                      <div className="mt-1 text-xs font-semibold text-[#176a5f]">
+                        Available to pitch
+                      </div>
+                    )}
                   </div>
                   <input
                     className="h-11 w-24 rounded-md border border-[#d8d2c4] px-3 text-lg font-semibold"
@@ -535,6 +1009,28 @@ function PitchTab({
                       }))
                     }
                   />
+                </div>
+                <div className="mt-3 grid grid-cols-3 gap-2">
+                  <button
+                    className="h-10 rounded-md border border-[#d8d2c4] text-sm font-semibold disabled:text-[#b6b0a4]"
+                    disabled={index === 0}
+                    onClick={() => onMovePitcher(player.id, -1)}
+                  >
+                    Up
+                  </button>
+                  <button
+                    className="h-10 rounded-md border border-[#d8d2c4] text-sm font-semibold disabled:text-[#b6b0a4]"
+                    disabled={index === pitchQueue.length - 1}
+                    onClick={() => onMovePitcher(player.id, 1)}
+                  >
+                    Down
+                  </button>
+                  <button
+                    className="h-10 rounded-md border border-[#d8d2c4] text-sm font-semibold text-[#9b3d2e]"
+                    onClick={() => onRemovePitcher(player.id)}
+                  >
+                    Remove
+                  </button>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2 text-sm">
                   <span className="rounded-md bg-[#fbfaf5] px-2 py-1 font-semibold">
@@ -552,7 +1048,12 @@ function PitchTab({
                 </div>
               </div>
             );
-          })}
+          })
+        ) : (
+          <div className="rounded-lg border border-[#d8d2c4] bg-white p-4 text-sm text-[#66716d] shadow-sm">
+            No pitchers queued yet. Use Setup to tap P for interested kids, then add them here.
+          </div>
+        )}
       </div>
     </section>
   );
@@ -690,6 +1191,16 @@ function mergeSeasonStats(current: SeasonStats, incoming: SeasonStats) {
   return merged;
 }
 
+function getPitcherInnings(assignments: Assignment[]) {
+  return assignments.reduce<Record<string, number[]>>((acc, assignment) => {
+    const pitcher = assignment.positions.P;
+    if (assignment.inning > 0 && pitcher) {
+      acc[pitcher.id] = [...(acc[pitcher.id] ?? []), assignment.inning];
+    }
+    return acc;
+  }, {});
+}
+
 function emptyStats(): PlayerSeasonStats {
   return {
     fieldInnings: 0,
@@ -787,4 +1298,3 @@ function PlayerEditor({
     </div>
   );
 }
-

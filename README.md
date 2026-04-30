@@ -11,6 +11,7 @@ Lil Leaguer is a game-day helper for assistant coaches managing Portland AAA Lit
 - Tracks pitch counts, daily pitch limits by league age, rest days, and pitcher/catcher lockouts.
 - Saves roster, pitch-count state, and season fairness totals in the browser for quick use at the field.
 - Lets one coach save each completed game to carry bench and position fairness across the season.
+- Can sync an active game between coaches using a Supabase-backed team code.
 
 ## AAA Rules Included
 
@@ -34,6 +35,18 @@ npm run dev
 ```
 
 Open `http://localhost:3000`.
+
+## Shared Coach Sync
+
+For realtime/shared use, create the Supabase tables with `supabase/schema.sql`, then set:
+
+```bash
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
+```
+
+The browser uses the publishable key for realtime updates. Writes go through Next.js API routes using the server-only service role key.
 
 ## Deploying
 
