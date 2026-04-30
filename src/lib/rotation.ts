@@ -32,6 +32,10 @@ export type PlayerSeasonStats = {
   benchInnings: number;
   pitches: number;
   games: number;
+  battingGames?: number;
+  battingOrderTotal?: number;
+  leadoffGames?: number;
+  bottomThirdGames?: number;
   positions: Partial<Record<Position, number>>;
 };
 
@@ -50,20 +54,19 @@ export const POSITIONS: Position[] = [
 ];
 
 export const DEFAULT_PLAYERS: Player[] = [
-  "Caleb",
-  "Owen",
-  "Mason",
-  "Henry",
-  "Jack",
-  "Leo",
-  "Noah",
+  "Cameron",
+  "George",
+  "Kamari",
+  "Kordell",
+  "Felix",
+  "Isaac",
+  "Benjamin",
+  "Chance",
+  "Lincoln",
+  "Sonny",
   "Finn",
-  "Sam",
-  "Miles",
-  "Theo",
-  "Eli",
-  "Lucas",
-  "Max",
+  "Finley",
+  "Coen",
 ].map((name, index) => ({
   id: `p${index + 1}`,
   name,
@@ -108,6 +111,36 @@ export function restDaysForPitches(pitches: number) {
   if (pitches <= 50) return 2;
   if (pitches <= 65) return 3;
   return 4;
+}
+
+export function generateBattingOrder(players: Player[], seasonStats: SeasonStats = {}) {
+  const presentPlayers = players.filter((player) => player.present);
+  const lineupSize = presentPlayers.length || 1;
+  const bottomThirdStart = Math.floor((lineupSize * 2) / 3) + 1;
+
+  return [...presentPlayers]
+    .map((player) => {
+      const stats = seasonStats[player.id];
+      const battingGames = stats?.battingGames ?? 0;
+      const averageSlot = battingGames
+        ? (stats?.battingOrderTotal ?? 0) / battingGames
+        : lineupSize + 1;
+      const bottomThirdGames = stats?.bottomThirdGames ?? 0;
+      const leadoffGames = stats?.leadoffGames ?? 0;
+      const score =
+        averageSlot * 10 +
+        bottomThirdGames * 14 -
+        leadoffGames * 18 +
+        ((player.name.charCodeAt(0) + player.id.length) % 7) / 10;
+
+      return {
+        player,
+        score,
+        bottomThirdStart,
+      };
+    })
+    .sort((a, b) => b.score - a.score || a.player.name.localeCompare(b.player.name))
+    .map(({ player }) => player.id);
 }
 
 export function generateAssignments(players: Player[], seasonStats: SeasonStats = {}): Assignment[] {

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { DEFAULT_PLAYERS, generateAssignments } from "@/lib/rotation";
+import { DEFAULT_PLAYERS, generateAssignments, generateBattingOrder } from "@/lib/rotation";
+import { defaultActiveGameId, mergeSeasonSchedule } from "@/lib/season";
 import type { SharedGameState } from "@/lib/shared-game";
 import { createShareCode, hasSupabaseServerEnv, supabaseRest } from "@/lib/supabase-server";
 
@@ -27,10 +28,21 @@ export async function POST(request: Request) {
   };
 
   const players = body.state?.players?.length ? body.state.players : DEFAULT_PLAYERS;
+  const seasonSchedule = mergeSeasonSchedule(body.state?.seasonSchedule);
   const initialState: SharedGameState = {
     players,
     pitchLog: body.state?.pitchLog ?? {},
+    pitchTracker: body.state?.pitchTracker ?? {
+      balls: 0,
+      strikes: 0,
+      outs: 0,
+      coachPitch: false,
+      history: [],
+    },
     pitchQueue: body.state?.pitchQueue ?? players.filter((player) => player.wants.includes("P")).map((player) => player.id),
+    battingOrder: body.state?.battingOrder ?? generateBattingOrder(players, body.state?.seasonStats ?? {}),
+    seasonSchedule,
+    activeEventId: body.state?.activeEventId ?? defaultActiveGameId(seasonSchedule),
     seasonStats: body.state?.seasonStats ?? {},
     gameHistory: body.state?.gameHistory ?? [],
     gamePlan: body.state?.gamePlan ?? generateAssignments(players, body.state?.seasonStats ?? {}),
@@ -73,4 +85,3 @@ export async function POST(request: Request) {
 
   return NextResponse.json({ error: "Could not create team." }, { status: 500 });
 }
-
