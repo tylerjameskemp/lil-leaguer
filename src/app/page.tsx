@@ -18,6 +18,7 @@ import {
 } from "@/lib/rotation";
 import { defaultActiveGameId, mergeSeasonSchedule } from "@/lib/season";
 import type {
+  AttendanceByEventId,
   GameFlow,
   GameFlowSnapshot,
   GameHalf,
@@ -34,6 +35,7 @@ type Tab = "today" | "field" | "batting" | "pitch" | "roster" | "season";
 type ScheduleStatus = "planned" | "today" | "in_progress" | "completed" | "past";
 type StoredState = {
   players?: Player[];
+  attendanceByEventId?: AttendanceByEventId;
   pitchLog?: PitchLog;
   pitchTracker?: PitchTracker;
   gameFlow?: GameFlow;
@@ -74,14 +76,18 @@ export default function Home() {
   const initialSchedule = mergeSeasonSchedule(stored.seasonSchedule);
   const initialActiveEventId = stored.activeEventId ?? defaultActiveGameId(initialSchedule);
   const initialSeasonEvent = initialSchedule.find((event) => event.id === initialActiveEventId);
+  const initialGameFlow = migratedStarterRoster
+    ? defaultGameFlow(initialSeasonEvent)
+    : normalizeGameFlow(stored.gameFlow, initialSeasonEvent);
   const [players, setPlayers] = useState<Player[]>(() => initialPlayers);
+  const [attendanceByEventId, setAttendanceByEventId] = useState<AttendanceByEventId>(
+    () => stored.attendanceByEventId ?? {},
+  );
   const [pitchLog, setPitchLog] = useState<PitchLog>(() => (migratedStarterRoster ? {} : stored.pitchLog ?? {}));
   const [pitchTracker, setPitchTracker] = useState<PitchTracker>(() =>
     migratedStarterRoster ? emptyPitchTracker() : normalizePitchTracker(stored.pitchTracker),
   );
-  const [gameFlow, setGameFlow] = useState<GameFlow>(() =>
-    migratedStarterRoster ? defaultGameFlow(initialSeasonEvent) : normalizeGameFlow(stored.gameFlow, initialSeasonEvent),
-  );
+  const [gameFlow, setGameFlow] = useState<GameFlow>(() => initialGameFlow);
   const [pitchQueue, setPitchQueue] = useState<string[]>(() => (migratedStarterRoster ? [] : stored.pitchQueue ?? []));
   const [seasonStats, setSeasonStats] = useState<SeasonStats>(() =>
     migratedStarterRoster ? {} : stored.seasonStats ?? {},
@@ -105,6 +111,7 @@ export default function Home() {
   );
   const [inningsPlayed, setInningsPlayed] = useState(() => stored.inningsPlayed ?? 4);
   const [activeTab, setActiveTab] = useState<Tab>("today");
+  const [fieldPreviewInning, setFieldPreviewInning] = useState(() => initialGameFlow.inning);
   const [menuOpen, setMenuOpen] = useState(false);
   const [teamSession, setTeamSession] = useState<TeamSession | undefined>(() => stored.teamSession);
   const [syncStatus, setSyncStatus] = useState<"local" | "live" | "saving" | "offline" | "conflict">(
@@ -125,6 +132,7 @@ export default function Home() {
       STORAGE_KEY,
       JSON.stringify({
         players,
+        attendanceByEventId,
         pitchLog,
         pitchTracker,
         gameFlow,
@@ -141,6 +149,7 @@ export default function Home() {
     );
   }, [
     players,
+    attendanceByEventId,
     pitchLog,
     pitchTracker,
     gameFlow,
@@ -157,26 +166,31 @@ export default function Home() {
 
   const innings = gamePlan.filter((assignment) => assignment.inning > 0);
   const compliance = gamePlan.find((assignment) => assignment.inning === 0)?.notes ?? [];
-  const activeInning = gameFlow.inning;
-  const activeAssignment = innings.find((assignment) => assignment.inning === activeInning) ?? innings[0];
-  const presentPlayers = players.filter((player) => player.present);
-  const presentCount = presentPlayers.length;
   const activeSeasonEvent = useMemo(
     () => seasonSchedule.find((event) => event.id === activeEventId),
     [seasonSchedule, activeEventId],
   );
+  const effectivePlayers = useMemo(
+    () => applyEventAttendance(players, activeEventId, attendanceByEventId),
+    [players, activeEventId, attendanceByEventId],
+  );
+  const activeInning = fieldPreviewInning;
+  const activeAssignment = innings.find((assignment) => assignment.inning === activeInning) ?? innings[0];
+  const currentAssignment = innings.find((assignment) => assignment.inning === gameFlow.inning) ?? innings[0];
+  const presentPlayers = effectivePlayers.filter((player) => player.present);
+  const presentCount = presentPlayers.length;
   const battingHalf = gameFlow.battingHalf ?? inferBattingHalf(activeSeasonEvent);
   const isOurBattingHalf = gameFlow.half === battingHalf;
   const completedFieldInnings = completedDefensiveInningCount(gameFlow, battingHalf);
   const visibleInnings = innings.slice(0, completedFieldInnings);
   const pitcherInnings = useMemo(() => getPitcherInnings(innings), [innings]);
   const pitcherQueuePlayers = useMemo(
-    () => pitchQueue.map((id) => players.find((player) => player.id === id)).filter(Boolean) as Player[],
-    [pitchQueue, players],
+    () => pitchQueue.map((id) => effectivePlayers.find((player) => player.id === id)).filter(Boolean) as Player[],
+    [pitchQueue, effectivePlayers],
   );
   const activePitcher =
-    activeAssignment?.positions.P ??
-    players.find((player) => player.id === pitchTracker.pitcherId) ??
+    currentAssignment?.positions.P ??
+    effectivePlayers.find((player) => player.id === pitchTracker.pitcherId) ??
     pitcherQueuePlayers[0];
   const activePitchCount = activePitcher ? pitchLog[activePitcher.id] ?? 0 : 0;
   const selectedEventStatus = activeSeasonEvent
@@ -193,18 +207,19 @@ export default function Home() {
     const presentIds = new Set(presentPlayers.map((player) => player.id));
     const ordered = battingOrder
       .filter((id) => presentIds.has(id))
-      .map((id) => players.find((player) => player.id === id))
+      .map((id) => effectivePlayers.find((player) => player.id === id))
       .filter(Boolean) as Player[];
     const missing = presentPlayers.filter((player) => !battingOrder.includes(player.id));
     return [...ordered, ...missing];
-  }, [battingOrder, players, presentPlayers]);
+  }, [battingOrder, effectivePlayers, presentPlayers]);
   const gameSummary = useMemo(
-    () => summarizeGame(players, visibleInnings, pitchLog, battingOrderPlayers),
-    [players, visibleInnings, pitchLog, battingOrderPlayers],
+    () => summarizeGame(effectivePlayers, visibleInnings, pitchLog, battingOrderPlayers),
+    [effectivePlayers, visibleInnings, pitchLog, battingOrderPlayers],
   );
   const sharedGameState = useMemo<SharedGameState>(
     () => ({
       players,
+      attendanceByEventId,
       pitchLog,
       pitchTracker,
       gameFlow,
@@ -219,6 +234,7 @@ export default function Home() {
     }),
     [
       players,
+      attendanceByEventId,
       pitchLog,
       pitchTracker,
       gameFlow,
@@ -251,10 +267,15 @@ export default function Home() {
     const nextSchedule = mergeSeasonSchedule(state.seasonSchedule);
     const nextActiveEventId = state.activeEventId ?? defaultActiveGameId(nextSchedule);
     const nextSeasonEvent = nextSchedule.find((event) => event.id === nextActiveEventId);
+    const nextGameFlow = migratedStarterRoster
+      ? defaultGameFlow(nextSeasonEvent)
+      : normalizeGameFlow(state.gameFlow, nextSeasonEvent);
     setPlayers(nextPlayers);
+    setAttendanceByEventId(state.attendanceByEventId ?? {});
     setPitchLog(migratedStarterRoster ? {} : state.pitchLog);
     setPitchTracker(migratedStarterRoster ? emptyPitchTracker() : normalizePitchTracker(state.pitchTracker));
-    setGameFlow(migratedStarterRoster ? defaultGameFlow(nextSeasonEvent) : normalizeGameFlow(state.gameFlow, nextSeasonEvent));
+    setGameFlow(nextGameFlow);
+    setFieldPreviewInning(nextGameFlow.inning);
     setPitchQueue(migratedStarterRoster ? [] : state.pitchQueue);
     setBattingOrder(
       migratedStarterRoster
@@ -475,17 +496,18 @@ export default function Home() {
   }
 
   function regenerateFullGamePlan() {
-    const nextPlan = generateAssignments(players, seasonStats);
+    const nextPlan = generateAssignments(effectivePlayers, seasonStats);
+    const nextFlow = defaultGameFlow(activeSeasonEvent);
     setGamePlan(nextPlan);
-    setBattingOrder(generateBattingOrder(players, seasonStats));
-    setGameFlow(defaultGameFlow(activeSeasonEvent));
+    setGameFlow(nextFlow);
+    setFieldPreviewInning(nextFlow.inning);
     setPitchTracker(emptyPitchTracker());
     setPitchLog({});
     setActiveTab("field");
   }
 
   function regenerateBattingOrder() {
-    setBattingOrder(generateBattingOrder(players, seasonStats));
+    setBattingOrder(generateBattingOrder(effectivePlayers, seasonStats));
     setActiveTab("batting");
   }
 
@@ -523,12 +545,17 @@ export default function Home() {
   }
 
   function recordOut() {
+    if (gameFlow.outs + 1 >= 3) {
+      moveToNextHalf(gameFlow, "Three outs.");
+      return;
+    }
+
     updateGameFlow((current) => {
       const outs = Math.min(3, current.outs + 1);
       return {
         ...current,
         outs,
-        notice: outs >= 3 ? "Three outs. Switch sides when ready." : "Out added.",
+        notice: "Out added.",
       };
     });
   }
@@ -550,21 +577,29 @@ export default function Home() {
   }
 
   function nextHalfInning() {
-    const current = gameFlow;
+    moveToNextHalf(gameFlow);
+  }
+
+  function buildNextHalfFlow(current: GameFlow, reasonPrefix = ""): GameFlow {
     const nextHalf: GameHalf = current.half === "top" ? "bottom" : "top";
     const nextInning = current.half === "bottom" ? Math.min(AAA_RULES.innings, current.inning + 1) : current.inning;
-    const nextFlow: GameFlow = {
+    return {
       ...current,
       inning: nextInning,
       half: nextHalf,
       outs: 0,
       runsThisHalf: 0,
       battersThisHalf: 0,
-      notice: `${halfLabel(nextHalf)} ${nextInning}.`,
+      notice: `${reasonPrefix ? `${reasonPrefix} ` : ""}${halfLabel(nextHalf)} ${nextInning}.`,
       history: [...current.history, snapshotGameFlow(current)].slice(-30),
-      status: "live",
+      status: "live" as const,
     };
+  }
+
+  function moveToNextHalf(current: GameFlow, reasonPrefix = "") {
+    const nextFlow = buildNextHalfFlow(current, reasonPrefix);
     setGameFlow(nextFlow);
+    setFieldPreviewInning(nextFlow.inning);
     setPitchTracker((tracker) => ({
       ...tracker,
       balls: 0,
@@ -573,10 +608,12 @@ export default function Home() {
       coachPitch: false,
       notice: "New half-inning.",
     }));
-    setActiveTab(nextHalf === battingHalf ? "batting" : "field");
+    setActiveTab(nextFlow.half === battingHalf ? "batting" : "field");
   }
 
   function undoGameFlow() {
+    const previous = gameFlow.history[gameFlow.history.length - 1];
+    if (previous) setFieldPreviewInning(previous.inning);
     setGameFlow((current) => {
       const previous = current.history[current.history.length - 1];
       if (!previous) return current;
@@ -603,6 +640,31 @@ export default function Home() {
     setPlayers((current) =>
       current.map((player) => (player.id === id ? { ...player, ...patch } : player)),
     );
+  }
+
+  function updateRosterPlayer(id: string, patch: Partial<Player>) {
+    const { present, ...globalPatch } = patch;
+    if (present !== undefined) {
+      setEventAttendance(id, present);
+    }
+    if (Object.keys(globalPatch).length) {
+      updatePlayer(id, globalPatch);
+    }
+  }
+
+  function setEventAttendance(playerId: string, present: boolean) {
+    if (!activeEventId) {
+      updatePlayer(playerId, { present });
+      return;
+    }
+
+    setAttendanceByEventId((current) => ({
+      ...current,
+      [activeEventId]: {
+        ...(current[activeEventId] ?? {}),
+        [playerId]: present,
+      },
+    }));
   }
 
   function togglePosition(id: string, field: "wants" | "avoid", position: Position) {
@@ -641,7 +703,7 @@ export default function Home() {
       current.map((assignment) => {
         if (assignment.inning !== inning || assignment.inning === 0) return assignment;
 
-        const selected = players.find((player) => player.id === playerId);
+        const selected = effectivePlayers.find((player) => player.id === playerId);
         const currentPlayer = assignment.positions[position];
         const positions = { ...assignment.positions };
         const bench = assignment.bench.filter((player) => player.id !== playerId);
@@ -673,7 +735,7 @@ export default function Home() {
 
   function assignGamePosition(inning: number, position: Position, playerId: string) {
     assignPosition(inning, position, playerId);
-    if (position === "P" && inning === activeInning) {
+    if (position === "P" && inning === gameFlow.inning) {
       syncPitcherTracker(playerId, "Pitcher changed on Field.");
     }
   }
@@ -682,7 +744,7 @@ export default function Home() {
     setGamePlan((current) =>
       current.map((assignment) => {
         if (assignment.inning !== inning || assignment.inning === 0) return assignment;
-        const player = players.find((candidate) => candidate.id === playerId);
+        const player = effectivePlayers.find((candidate) => candidate.id === playerId);
         if (!player) return assignment;
 
         const positions = { ...assignment.positions };
@@ -692,6 +754,24 @@ export default function Home() {
         const bench = assignment.bench.some((candidate) => candidate.id === playerId)
           ? assignment.bench
           : [...assignment.bench, player].sort((a, b) => a.name.localeCompare(b.name));
+
+        return { ...assignment, positions, bench };
+      }),
+    );
+  }
+
+  function fillOpenSpots(inning: number) {
+    setGamePlan((current) =>
+      current.map((assignment) => {
+        if (assignment.inning !== inning || assignment.inning === 0) return assignment;
+
+        const positions = { ...assignment.positions };
+        const bench = [...assignment.bench];
+        POSITIONS.forEach((position) => {
+          if (positions[position] || bench.length === 0) return;
+          const nextPlayer = bench.shift();
+          if (nextPlayer) positions[position] = nextPlayer;
+        });
 
         return { ...assignment, positions, bench };
       }),
@@ -718,7 +798,9 @@ export default function Home() {
     ]);
     setPitchLog({});
     setPitchTracker(emptyPitchTracker());
-    setGameFlow(defaultGameFlow(nextEvent));
+    const nextFlow = defaultGameFlow(nextEvent);
+    setGameFlow(nextFlow);
+    setFieldPreviewInning(nextFlow.inning);
     setActiveEventId(nextEventId);
     setActiveTab("season");
   }
@@ -733,7 +815,9 @@ export default function Home() {
     const isAlreadyActive = eventId === activeEventId;
     setActiveEventId(eventId);
     if (!isAlreadyActive) {
-      setGameFlow(defaultGameFlow(event));
+      const nextFlow = defaultGameFlow(event);
+      setGameFlow(nextFlow);
+      setFieldPreviewInning(nextFlow.inning);
     }
   }
 
@@ -776,13 +860,13 @@ export default function Home() {
   }
 
   function changeCurrentPitcher(playerId: string) {
-    assignPosition(activeInning, "P", playerId);
+    assignPosition(gameFlow.inning, "P", playerId);
     syncPitcherTracker(playerId);
   }
 
   function moveBatter(playerId: string, direction: -1 | 1) {
     setBattingOrder((current) => {
-      const normalized = normalizeBattingOrder(players, current);
+      const normalized = normalizeBattingOrder(effectivePlayers, current);
       const index = normalized.indexOf(playerId);
       const nextIndex = index + direction;
       if (index < 0 || nextIndex < 0 || nextIndex >= normalized.length) return normalized;
@@ -795,13 +879,13 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-[#f6f4ed] text-[#17211f]">
       <header className="sticky top-0 z-20 border-b border-[#d8d2c4] bg-[#fbfaf5]/95 backdrop-blur">
-        <div className="mx-auto max-w-5xl px-4 py-3">
+        <div className="mx-auto max-w-5xl px-3 py-2 sm:px-4">
           <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-[#9b3d2e]">
+            <div className="min-w-0">
+              <p className="text-[0.65rem] font-semibold uppercase tracking-[0.14em] text-[#9b3d2e]">
                 Portland AAA
               </p>
-              <h1 className="text-2xl font-bold tracking-normal">Lil Leaguer</h1>
+              <h1 className="text-xl font-bold leading-tight tracking-normal">Lil Leaguer</h1>
               {activeSeasonEvent ? (
                 <p className="mt-0.5 max-w-[210px] truncate text-xs font-semibold text-[#66716d] sm:max-w-md">
                   {eventStatusLabel(selectedEventStatus)} · {activeSeasonEvent.title}
@@ -850,16 +934,15 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="mt-3 grid grid-cols-4 gap-1.5 text-center">
-            <Metric label="Inning" value={`${halfLabel(gameFlow.half)} ${gameFlow.inning}`} />
-            <Metric label="Score" value={`${gameFlow.ourRuns}-${gameFlow.theirRuns}`} />
-            <Metric label="Outs" value={`${gameFlow.outs}`} />
-            <Metric label="P" value={activePitcher ? `${activePitcher.name} ${activePitchCount}` : "-"} />
-          </div>
+          <HeaderStatus
+            activePitchCount={activePitchCount}
+            activePitcher={activePitcher}
+            gameFlow={gameFlow}
+          />
         </div>
       </header>
 
-      <div className="mx-auto max-w-5xl px-4 pb-24 pt-4">
+        <div className="mx-auto max-w-5xl px-3 pb-24 pt-3 sm:px-4">
         {!teamSession ? (
           <SyncPanel
             joinCode={joinCode}
@@ -904,13 +987,15 @@ export default function Home() {
             activeAssignment={activeAssignment}
             activeInning={activeInning}
             compliance={compliance}
+            currentInning={gameFlow.inning}
             pitchLog={pitchLog}
             pitcherInnings={pitcherInnings}
             pitcherQueue={pitcherQueuePlayers}
-            players={players}
-            seasonEvent={activeSeasonEvent}
+            players={effectivePlayers}
             onAssign={assignGamePosition}
             onBench={benchPlayer}
+            onFillOpenSpots={fillOpenSpots}
+            onPreviewInning={setFieldPreviewInning}
             onSave={saveGameToSeason}
           />
         ) : null}
@@ -930,9 +1015,10 @@ export default function Home() {
 
         {activeTab === "roster" ? (
           <RosterTab
-            players={players}
+            activeEvent={activeSeasonEvent}
+            players={effectivePlayers}
             onAdd={addPlayer}
-            onChange={updatePlayer}
+            onChange={updateRosterPlayer}
             onToggle={togglePosition}
             onGenerate={regenerateFullGamePlan}
           />
@@ -941,14 +1027,14 @@ export default function Home() {
         {activeTab === "pitch" ? (
           <PitchTab
             gameFlow={gameFlow}
-            players={players}
+            players={effectivePlayers}
             pitchLog={pitchLog}
             pitchTracker={pitchTracker}
             pitcherInnings={pitcherInnings}
             pitchQueue={pitcherQueuePlayers}
             setPitchLog={setPitchLog}
             setPitchTracker={setPitchTracker}
-            currentPitcherId={activeAssignment?.positions.P?.id}
+            currentPitcherId={currentAssignment?.positions.P?.id}
             onAddPitcher={addPitcher}
             onChangeCurrentPitcher={changeCurrentPitcher}
             onOut={() => recordOut()}
@@ -1113,20 +1199,17 @@ function GameControl({
   onUndo: () => void;
 }) {
   const limitNotice = halfInningNotice(gameFlow, lineupSize);
+  const displayNotice = limitNotice ?? importantGameNotice(gameFlow.notice);
+  const nextHalfText = nextHalfInningLabel(gameFlow);
 
   return (
-    <section className="mb-4 rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-semibold">
-            {halfLabel(gameFlow.half)} {gameFlow.inning}
-          </h2>
-          <p className="text-sm text-[#66716d]">
-            {isOurBattingHalf ? "Clam Bar batting" : "Clam Bar fielding"} · bats {halfLabel(battingHalf).toLowerCase()}
-          </p>
-        </div>
+    <section className="mb-3 rounded-lg border border-[#d8d2c4] bg-white p-2 shadow-sm">
+      <div className="flex items-center justify-between gap-2">
+        <p className="min-w-0 truncate text-sm font-bold">
+          {isOurBattingHalf ? "Clam Bar batting" : "Clam Bar fielding"}
+        </p>
         <button
-          className="h-10 rounded-md border border-[#d8d2c4] px-3 text-sm font-semibold"
+          className="h-9 shrink-0 rounded-md border border-[#d8d2c4] px-2.5 text-xs font-semibold"
           onClick={onToggleBattingHalf}
           type="button"
         >
@@ -1134,20 +1217,18 @@ function GameControl({
         </button>
       </div>
 
-      <div className="mt-3 grid grid-cols-4 gap-2 text-center">
-        <MiniStat label="Score" value={`${gameFlow.ourRuns}-${gameFlow.theirRuns}`} />
-        <MiniStat label="Outs" value={`${gameFlow.outs}/3`} />
+      <div className="mt-2 grid grid-cols-2 gap-2 text-center">
         <MiniStat label="Runs" value={`${gameFlow.runsThisHalf}/5`} />
-        <MiniStat label="Batters" value={`${gameFlow.battersThisHalf}`} />
+        <MiniStat label="Batters" value={`${gameFlow.battersThisHalf}/${lineupSize || 1}`} />
       </div>
 
-      {limitNotice || gameFlow.notice ? (
-        <div className="mt-3 rounded-md border border-[#e6c08b] bg-[#fff8e9] px-3 py-2 text-sm font-semibold text-[#5f5541]">
-          {limitNotice ?? gameFlow.notice}
+      {displayNotice ? (
+        <div className="mt-2 rounded-md border border-[#e6c08b] bg-[#fff8e9] px-3 py-2 text-sm font-semibold text-[#5f5541]">
+          {displayNotice}
         </div>
       ) : null}
 
-      <div className="mt-3 grid grid-cols-4 gap-2">
+      <div className="mt-2 grid grid-cols-4 gap-2">
         <button className="h-11 rounded-md bg-[#176a5f] text-sm font-bold text-white" onClick={onRun}>
           Run +1
         </button>
@@ -1162,7 +1243,7 @@ function GameControl({
           Undo
         </button>
         <button className="h-11 rounded-md border border-[#d8d2c4] text-sm font-semibold" onClick={onNextHalf}>
-          Next Half
+          Next: {nextHalfText}
         </button>
       </div>
     </section>
@@ -1278,58 +1359,125 @@ function SyncBadge({
   );
 }
 
+function HeaderStatus({
+  activePitchCount,
+  activePitcher,
+  gameFlow,
+}: {
+  activePitchCount: number;
+  activePitcher?: Player;
+  gameFlow: GameFlow;
+}) {
+  return (
+    <div className="mt-3 flex items-center gap-1.5 overflow-x-auto pb-1 text-sm [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <StatusPill value={`${halfLabel(gameFlow.half)} ${gameFlow.inning}`} />
+      <StatusPill value={`${gameFlow.ourRuns}-${gameFlow.theirRuns}`} />
+      <StatusPill value={`${gameFlow.outs} out${gameFlow.outs === 1 ? "" : "s"}`} />
+      <StatusPill value={activePitcher ? `P ${activePitcher.name} ${activePitchCount}` : "P open"} wide />
+    </div>
+  );
+}
+
+function StatusPill({ value, wide = false }: { value: string; wide?: boolean }) {
+  return (
+    <span
+      className={`inline-flex h-8 shrink-0 items-center rounded-md border border-[#d8d2c4] bg-white px-2.5 font-bold text-[#17211f] shadow-sm ${
+        wide ? "max-w-[170px] truncate" : ""
+      }`}
+    >
+      {value}
+    </span>
+  );
+}
+
 function GameTab({
   activeAssignment,
   activeInning,
   compliance,
+  currentInning,
   pitchLog,
   pitcherInnings,
   pitcherQueue,
   players,
-  seasonEvent,
   onAssign,
   onBench,
+  onFillOpenSpots,
+  onPreviewInning,
   onSave,
 }: {
   activeAssignment?: Assignment;
   activeInning: number;
   compliance: string[];
+  currentInning: number;
   pitchLog: PitchLog;
   pitcherInnings: Record<string, number[]>;
   pitcherQueue: Player[];
   players: Player[];
-  seasonEvent?: SeasonEvent;
   onAssign: (inning: number, position: Position, playerId: string) => void;
   onBench: (inning: number, playerId: string) => void;
+  onFillOpenSpots: (inning: number) => void;
+  onPreviewInning: (inning: number) => void;
   onSave: () => void;
 }) {
   const presentPlayers = players.filter((player) => player.present);
   const nextPitcher = pitcherQueue.find((player) => !pitcherInnings[player.id]?.length);
+  const openPositions = activeAssignment
+    ? POSITIONS.filter((position) => !activeAssignment.positions[position])
+    : [];
+  const canFillOpenSpots = Boolean(activeAssignment?.bench.length && openPositions.length);
+  const isPreviewing = activeInning !== currentInning;
+  const visibleCompliance = compliance.filter((note) => !note.startsWith("Rotation satisfies"));
 
   return (
-    <section className="space-y-4">
-      <div className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h2 className="text-lg font-semibold">Field Positions</h2>
-            <p className="text-sm text-[#66716d]">
-              {seasonEvent ? seasonEvent.title : "Tap names to swap. Pitchers cannot re-enter later."}
-            </p>
-            {seasonEvent ? (
-              <p className="mt-1 text-xs font-semibold text-[#176a5f]">
-                {formatEventDateTime(seasonEvent.start)} · {shortFieldName(seasonEvent.field)}
-              </p>
-            ) : null}
-          </div>
-          <div className="rounded-md bg-[#fbfaf5] px-3 py-2 text-right">
-            <div className="text-xs font-bold uppercase tracking-[0.1em] text-[#66716d]">Inning</div>
-            <div className="text-lg font-bold">{activeInning}</div>
-          </div>
+    <section className="space-y-3">
+      <div className="flex items-end justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="text-lg font-semibold">Field</h2>
+          <p className="truncate text-sm text-[#66716d]">
+            Inning {activeInning}
+            {isPreviewing ? ` preview; pitch follows ${currentInning}` : " positions"}
+            {nextPitcher ? ` · next P ${nextPitcher.name}` : ""}
+          </p>
+        </div>
+        <div className="grid w-[168px] shrink-0 grid-cols-3 gap-1.5">
+          <button
+            className="h-9 rounded-md border border-[#d8d2c4] bg-white text-xs font-semibold disabled:text-[#b6b0a4]"
+            disabled={activeInning <= 1}
+            onClick={() => onPreviewInning(Math.max(1, activeInning - 1))}
+          >
+            Prev
+          </button>
+          <button
+            className="h-9 rounded-md border border-[#d8d2c4] bg-white text-xs font-semibold"
+            onClick={() => onPreviewInning(currentInning)}
+          >
+            Now
+          </button>
+          <button
+            className="h-9 rounded-md border border-[#d8d2c4] bg-white text-xs font-semibold disabled:text-[#b6b0a4]"
+            disabled={activeInning >= AAA_RULES.innings}
+            onClick={() => onPreviewInning(Math.min(AAA_RULES.innings, activeInning + 1))}
+          >
+            Next
+          </button>
         </div>
       </div>
 
       {activeAssignment ? (
         <div className="space-y-3">
+          {canFillOpenSpots ? (
+            <div className="rounded-lg border border-[#efb3a5] bg-[#fff1ed] p-3 text-sm text-[#9b3d2e]">
+              <p className="font-semibold">
+                {openPositions.join(", ")} open with {activeAssignment.bench.length} on the bench.
+              </p>
+              <button
+                className="mt-2 h-10 w-full rounded-md bg-[#9b3d2e] px-3 text-sm font-bold text-white"
+                onClick={() => onFillOpenSpots(activeInning)}
+              >
+                Fill open spots from bench
+              </button>
+            </div>
+          ) : null}
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             {POSITIONS.map((position) => {
               const player = activeAssignment.positions[position];
@@ -1372,23 +1520,15 @@ function GameTab({
         </div>
       ) : null}
 
-      <div className="rounded-lg border border-[#e6c08b] bg-[#fff8e9] p-3 text-sm leading-6">
-        <p className="font-semibold">
-          {nextPitcher ? `Next queued pitcher: ${nextPitcher.name}` : "Short-game fairness"}
-        </p>
-        <p className="mt-1 text-[#5f5541]">
-          Defensive rotation is generated from Roster before the game. During play, make simple
-          swaps here and use Next Half to move the game forward.
-        </p>
-      </div>
-
-      <div className="space-y-2">
-        {compliance.map((note) => (
+      {visibleCompliance.length ? (
+        <div className="space-y-2">
+          {visibleCompliance.map((note) => (
           <div key={note} className="rounded-md border border-[#d8d2c4] bg-white px-3 py-2 text-sm">
             {note}
           </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      ) : null}
 
       <button
         className="h-12 w-full rounded-md bg-[#176a5f] px-4 text-base font-semibold text-white shadow-sm transition hover:bg-[#0f554c]"
@@ -1426,13 +1566,13 @@ function PositionRow({
       : "";
 
   return (
-    <label className="grid grid-cols-[58px_1fr] items-center gap-2 rounded-lg border border-[#d8d2c4] bg-white p-2 shadow-sm">
-      <span className="flex h-12 items-center justify-center rounded-md bg-[#fbfaf5] text-sm font-bold text-[#9b3d2e]">
+    <label className="grid grid-cols-[44px_1fr] items-center gap-2 rounded-md border border-[#d8d2c4] bg-white p-1.5">
+      <span className="flex h-10 items-center justify-center rounded-md bg-[#fbfaf5] text-sm font-bold text-[#9b3d2e]">
         {position}
       </span>
       <span>
         <select
-          className="h-12 w-full rounded-md border border-[#d8d2c4] bg-white px-3 text-base font-semibold"
+          className="h-10 w-full rounded-md border border-[#d8d2c4] bg-white px-3 text-base font-semibold"
           value={playerId}
           onChange={(event) => onChange(event.target.value)}
         >
@@ -1453,7 +1593,7 @@ function PositionRow({
             {pitcherWarning}
           </span>
         ) : null}
-        {requested ? <span className="mt-1 block text-xs font-semibold text-[#176a5f]">requested</span> : null}
+        {requested ? <span className="mt-0.5 block text-xs font-semibold text-[#176a5f]">requested</span> : null}
       </span>
     </label>
   );
@@ -1575,12 +1715,14 @@ function BattingTab({
 }
 
 function RosterTab({
+  activeEvent,
   players,
   onAdd,
   onChange,
   onToggle,
   onGenerate,
 }: {
+  activeEvent?: SeasonEvent;
   players: Player[];
   onAdd: () => void;
   onChange: (id: string, patch: Partial<Player>) => void;
@@ -1594,7 +1736,9 @@ function RosterTab({
       <div className="flex items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold">Roster</h2>
-          <p className="text-sm text-[#66716d]">Mark who is here and capture position asks.</p>
+          <p className="text-sm text-[#66716d]">
+            Attendance is for {activeEvent ? activeEvent.title : "this game"}; position asks stay global.
+          </p>
         </div>
         <button
           className="h-11 rounded-md bg-[#176a5f] px-4 text-sm font-semibold text-white"
@@ -1619,7 +1763,7 @@ function RosterTab({
         className="h-12 w-full rounded-md bg-[#176a5f] px-4 text-base font-semibold text-white"
         onClick={onGenerate}
       >
-        Build field plan
+        Build field plan for this game
       </button>
     </section>
   );
@@ -1659,13 +1803,20 @@ function PitchTab({
   onRemovePitcher: (playerId: string) => void;
 }) {
   const [selectedPitcher, setSelectedPitcher] = useState("");
-  const pitcherOptions = players.filter(
-    (player) => player.present && player.wants.includes("P") && !pitchQueue.some((queued) => queued.id === player.id),
-  );
   const activePitcher =
     players.find((player) => player.id === currentPitcherId) ??
     players.find((player) => player.id === pitchTracker.pitcherId) ??
     pitchQueue[0];
+  const queuedPitchers = activePitcher
+    ? pitchQueue.filter((player) => player.id !== activePitcher.id)
+    : pitchQueue;
+  const pitcherOptions = players.filter(
+    (player) =>
+      player.present &&
+      player.wants.includes("P") &&
+      player.id !== activePitcher?.id &&
+      !pitchQueue.some((queued) => queued.id === player.id),
+  );
   const activePitchCount = activePitcher ? pitchLog[activePitcher.id] ?? 0 : 0;
   const activeLimit = activePitcher ? pitchLimitForAge(activePitcher.age) : 0;
   const canTrack = Boolean(activePitcher);
@@ -1910,7 +2061,7 @@ function PitchTab({
 
       <div className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
         <h3 className="mb-3 text-sm font-bold uppercase tracking-[0.12em] text-[#176a5f]">
-          Pitcher Queue
+          Next Pitchers
         </h3>
         <div className="grid grid-cols-[1fr_auto] gap-2">
           <select
@@ -1937,16 +2088,17 @@ function PitchTab({
           </button>
         </div>
         <p className="mt-2 text-xs text-[#66716d]">
-          Mark kids as wanting P on Roster first, then arrange the pitching order here.
+          Current pitcher is selected above. Arrange who should be ready next.
         </p>
       </div>
 
       <div className="space-y-2">
-        {pitchQueue.length ? (
-          pitchQueue.map((player, index) => {
+        {queuedPitchers.length ? (
+          queuedPitchers.map((player, index) => {
             const pitches = pitchLog[player.id] ?? 0;
             const limit = pitchLimitForAge(player.age);
             const usedInnings = pitcherInnings[player.id] ?? [];
+            const queueIndex = pitchQueue.findIndex((queued) => queued.id === player.id);
             return (
               <div key={player.id} className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
                 <div className="flex items-center justify-between gap-3">
@@ -1987,14 +2139,14 @@ function PitchTab({
                 <div className="mt-3 grid grid-cols-3 gap-2">
                   <button
                     className="h-10 rounded-md border border-[#d8d2c4] text-sm font-semibold disabled:text-[#b6b0a4]"
-                    disabled={index === 0}
+                    disabled={queueIndex <= 0}
                     onClick={() => onMovePitcher(player.id, -1)}
                   >
                     Up
                   </button>
                   <button
                     className="h-10 rounded-md border border-[#d8d2c4] text-sm font-semibold disabled:text-[#b6b0a4]"
-                    disabled={index === pitchQueue.length - 1}
+                    disabled={queueIndex === pitchQueue.length - 1}
                     onClick={() => onMovePitcher(player.id, 1)}
                   >
                     Down
@@ -2025,7 +2177,7 @@ function PitchTab({
           })
         ) : (
           <div className="rounded-lg border border-[#d8d2c4] bg-white p-4 text-sm text-[#66716d] shadow-sm">
-            No pitchers queued yet. Use Roster to tap P for interested kids, then add them here.
+            No next pitchers queued yet. Use Roster to tap P for interested kids, then add them here.
           </div>
         )}
       </div>
@@ -2375,11 +2527,32 @@ function halfLabel(half: GameHalf) {
   return half === "top" ? "Top" : "Bottom";
 }
 
+function nextHalfInningLabel(flow: GameFlow) {
+  const nextHalf: GameHalf = flow.half === "top" ? "bottom" : "top";
+  const nextInning = flow.half === "bottom" ? Math.min(AAA_RULES.innings, flow.inning + 1) : flow.inning;
+  return `${halfLabel(nextHalf)} ${ordinal(nextInning)}`;
+}
+
+function ordinal(value: number) {
+  const remainder = value % 100;
+  if (remainder >= 11 && remainder <= 13) return `${value}th`;
+  if (value % 10 === 1) return `${value}st`;
+  if (value % 10 === 2) return `${value}nd`;
+  if (value % 10 === 3) return `${value}rd`;
+  return `${value}th`;
+}
+
 function halfInningNotice(flow: GameFlow, lineupSize = 0) {
   if (flow.outs >= 3) return "Three outs. Switch sides when ready.";
   if (flow.runsThisHalf >= AAA_RULES.maxRunsPerInning) return "Five-run limit reached. Switch sides when ready.";
   if (lineupSize > 0 && flow.battersThisHalf >= lineupSize) return "Batted through the lineup. Switch sides when ready.";
   return undefined;
+}
+
+function importantGameNotice(notice?: string) {
+  if (!notice) return undefined;
+  const quietPrefixes = ["Ready for", "Run added", "Out added", "Next batter", "Undid last game action"];
+  return quietPrefixes.some((prefix) => notice.startsWith(prefix)) ? undefined : notice;
 }
 
 function completedDefensiveInningCount(flow: GameFlow, battingHalf: GameHalf) {
@@ -2431,6 +2604,20 @@ function normalizeStoredPlayers(players?: Player[]) {
   if (hasOldStarterRoster(players)) return DEFAULT_PLAYERS;
 
   return players;
+}
+
+function applyEventAttendance(
+  players: Player[],
+  activeEventId: string | undefined,
+  attendanceByEventId: AttendanceByEventId,
+) {
+  if (!activeEventId) return players;
+  const attendance = attendanceByEventId[activeEventId];
+  if (!attendance) return players;
+  return players.map((player) => ({
+    ...player,
+    present: attendance[player.id] ?? player.present,
+  }));
 }
 
 function hasOldStarterRoster(players?: Player[]) {
@@ -2682,15 +2869,6 @@ function normalizeBattingOrder(players: Player[], order: string[]) {
   return [...existing, ...missing];
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-md border border-[#d8d2c4] bg-white px-2 py-2 shadow-sm">
-      <div className="text-[0.68rem] font-bold uppercase tracking-[0.1em] text-[#66716d]">{label}</div>
-      <div className="mt-0.5 text-xl font-bold">{value}</div>
-    </div>
-  );
-}
-
 function MiniStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-md bg-[#fbfaf5] px-2 py-2">
@@ -2746,7 +2924,7 @@ function PlayerEditor({
           type="checkbox"
           onChange={(event) => onChange({ present: event.target.checked })}
         />
-        Present today
+        Present for this game
       </label>
       <div className="mt-3">
         <div className="text-xs font-bold uppercase tracking-[0.12em] text-[#66716d]">Wants</div>

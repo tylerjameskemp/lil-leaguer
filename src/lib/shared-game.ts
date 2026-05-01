@@ -1,6 +1,7 @@
 import type { Assignment, Player, SeasonStats } from "@/lib/rotation";
 
 export type PitchLog = Record<string, number>;
+export type AttendanceByEventId = Record<string, Record<string, boolean>>;
 
 export type PitchTrackerSnapshot = {
   pitcherId?: string;
@@ -66,6 +67,7 @@ export type SeasonEvent = {
 
 export type SharedGameState = {
   players: Player[];
+  attendanceByEventId?: AttendanceByEventId;
   pitchLog: PitchLog;
   pitchTracker: PitchTracker;
   pitchQueue: string[];

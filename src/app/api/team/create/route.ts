@@ -34,6 +34,7 @@ export async function POST(request: Request) {
   const battingHalf = activeEvent?.homeAway === "home" ? "bottom" : "top";
   const initialState: SharedGameState = {
     players,
+    attendanceByEventId: body.state?.attendanceByEventId ?? {},
     pitchLog: body.state?.pitchLog ?? {},
     pitchTracker: body.state?.pitchTracker ?? {
       balls: 0,
