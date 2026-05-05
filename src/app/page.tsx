@@ -14,6 +14,7 @@ import {
   type Player,
   type PlayerSeasonStats,
   type Position,
+  type RotationStyle,
   type SeasonStats,
 } from "@/lib/rotation";
 import { defaultActiveGameId, mergeSeasonSchedule } from "@/lib/season";
@@ -31,7 +32,7 @@ import type {
   TeamSession,
 } from "@/lib/shared-game";
 
-type Tab = "today" | "field" | "batting" | "pitch" | "roster" | "season";
+type Tab = "today" | "lineup" | "pitch" | "roster" | "season";
 type ScheduleStatus = "planned" | "today" | "in_progress" | "completed" | "past";
 type StoredState = {
   players?: Player[];
@@ -109,6 +110,7 @@ export default function Home() {
       (migratedStarterRoster ? undefined : stored.gamePlan) ??
       generateAssignments(initialPlayers, migratedStarterRoster ? {} : stored.seasonStats ?? {}),
   );
+  const [rotationStyle, setRotationStyle] = useState<RotationStyle>("standard");
   const [inningsPlayed, setInningsPlayed] = useState(() => stored.inningsPlayed ?? 4);
   const [activeTab, setActiveTab] = useState<Tab>("today");
   const [fieldPreviewInning, setFieldPreviewInning] = useState(() => initialGameFlow.inning);
@@ -126,6 +128,8 @@ export default function Home() {
   const remoteApplyRef = useRef(false);
   const saveRequestRef = useRef(0);
   const syncStatusRef = useRef(syncStatus);
+  const fieldPlanVariantRef = useRef(0);
+  const battingOrderVariantRef = useRef(0);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -488,27 +492,53 @@ export default function Home() {
       lastSyncedStateRef.current = JSON.stringify(payload.game.state);
       setSyncStatus("live");
       setSyncMessage("Joined shared game.");
-      setActiveTab("field");
+      setActiveTab("lineup");
     } catch (error) {
       setSyncStatus("offline");
       setSyncMessage(String(error));
     }
   }
 
-  function regenerateFullGamePlan() {
-    const nextPlan = generateAssignments(effectivePlayers, seasonStats);
+  function regenerateFullGamePlan(style = rotationStyle) {
+    setRotationStyle(style);
+    fieldPlanVariantRef.current += 1;
+    const nextPlan = generateAssignments(effectivePlayers, seasonStats, {
+      style,
+      pitcherOrder: pitchQueue,
+      variant: fieldPlanVariantRef.current,
+    });
     const nextFlow = defaultGameFlow(activeSeasonEvent);
+    const firstPitcher = nextPlan.find((assignment) => assignment.inning === 1)?.positions.P;
     setGamePlan(nextPlan);
     setGameFlow(nextFlow);
     setFieldPreviewInning(nextFlow.inning);
-    setPitchTracker(emptyPitchTracker());
+    setPitchTracker({ ...emptyPitchTracker(), pitcherId: firstPitcher?.id });
     setPitchLog({});
-    setActiveTab("field");
+    setActiveTab("lineup");
   }
 
-  function regenerateBattingOrder() {
-    setBattingOrder(generateBattingOrder(effectivePlayers, seasonStats));
-    setActiveTab("batting");
+  function regenerateBattingLineup() {
+    battingOrderVariantRef.current += 1;
+    setBattingOrder(generateBattingOrder(effectivePlayers, seasonStats, battingOrderVariantRef.current));
+    setGameFlow((current) => ({
+      ...current,
+      currentBatterIndex: 0,
+      battersThisHalf: 0,
+      notice: "Batting lineup regenerated.",
+    }));
+    setActiveTab("lineup");
+  }
+
+  function moveBatter(playerId: string, direction: -1 | 1) {
+    setBattingOrder((current) => {
+      const normalized = normalizeBattingOrder(current, effectivePlayers);
+      const index = normalized.indexOf(playerId);
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= normalized.length) return normalized;
+      const next = [...normalized];
+      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+      return next;
+    });
   }
 
   function updateGameFlow(
@@ -573,7 +603,7 @@ export default function Home() {
             ? "Batted through the lineup. Switch sides when ready."
             : "Next batter.",
       };
-    }, "batting");
+    }, "lineup");
   }
 
   function nextHalfInning() {
@@ -608,7 +638,7 @@ export default function Home() {
       coachPitch: false,
       notice: "New half-inning.",
     }));
-    setActiveTab(nextFlow.half === battingHalf ? "batting" : "field");
+    setActiveTab("lineup");
   }
 
   function undoGameFlow() {
@@ -778,6 +808,38 @@ export default function Home() {
     );
   }
 
+  function markPlayerUnavailable(playerId: string) {
+    const player = effectivePlayers.find((candidate) => candidate.id === playerId);
+    if (!player) return;
+    const fromInning = Math.max(1, gameFlow.inning);
+
+    setGamePlan((current) =>
+      current.map((assignment) => {
+        if (assignment.inning === 0 || assignment.inning < fromInning) return assignment;
+
+        const positions = { ...assignment.positions };
+        const bench = assignment.bench.filter((candidate) => candidate.id !== playerId);
+        POSITIONS.forEach((position) => {
+          if (positions[position]?.id === playerId) delete positions[position];
+        });
+        POSITIONS.forEach((position) => {
+          if (positions[position] || bench.length === 0) return;
+          const nextPlayer = bench.shift();
+          if (nextPlayer) positions[position] = nextPlayer;
+        });
+
+        return { ...assignment, positions, bench };
+      }),
+    );
+    setBattingOrder((current) => current.filter((id) => id !== playerId));
+    setPitchQueue((current) => current.filter((id) => id !== playerId));
+    setPitchTracker((current) => (current.pitcherId === playerId ? emptyPitchTracker() : current));
+    setGameFlow((current) => ({
+      ...current,
+      notice: `${player.name} removed from inning ${fromInning} forward. Future spots were filled from the bench where possible.`,
+    }));
+  }
+
   function saveGameToSeason() {
     const savedEvent = activeSeasonEvent;
     const inningsCompleted = Math.max(1, completedFieldInnings);
@@ -821,7 +883,7 @@ export default function Home() {
     }
   }
 
-  function openEvent(eventId: string, tab: Tab = "field") {
+  function openEvent(eventId: string, tab: Tab = "lineup") {
     selectSeasonEvent(eventId);
     setActiveTab(tab);
   }
@@ -862,18 +924,6 @@ export default function Home() {
   function changeCurrentPitcher(playerId: string) {
     assignPosition(gameFlow.inning, "P", playerId);
     syncPitcherTracker(playerId);
-  }
-
-  function moveBatter(playerId: string, direction: -1 | 1) {
-    setBattingOrder((current) => {
-      const normalized = normalizeBattingOrder(effectivePlayers, current);
-      const index = normalized.indexOf(playerId);
-      const nextIndex = index + direction;
-      if (index < 0 || nextIndex < 0 || nextIndex >= normalized.length) return normalized;
-      const next = [...normalized];
-      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
-      return next;
-    });
   }
 
   return (
@@ -956,7 +1006,7 @@ export default function Home() {
           />
         ) : null}
 
-        {activeTab === "field" || activeTab === "batting" || activeTab === "pitch" ? (
+        {activeTab === "lineup" || activeTab === "pitch" ? (
           <GameControl
             battingHalf={battingHalf}
             gameFlow={gameFlow}
@@ -982,34 +1032,31 @@ export default function Home() {
           />
         ) : null}
 
-        {activeTab === "field" ? (
-          <GameTab
+        {activeTab === "lineup" ? (
+          <LineupTab
             activeAssignment={activeAssignment}
             activeInning={activeInning}
+            battingOrder={battingOrderPlayers}
             compliance={compliance}
             currentInning={gameFlow.inning}
+            gameFlow={gameFlow}
+            innings={innings}
             pitchLog={pitchLog}
             pitcherInnings={pitcherInnings}
             pitcherQueue={pitcherQueuePlayers}
             players={effectivePlayers}
+            rotationStyle={rotationStyle}
             onAssign={assignGamePosition}
             onBench={benchPlayer}
             onFillOpenSpots={fillOpenSpots}
-            onPreviewInning={setFieldPreviewInning}
-            onSave={saveGameToSeason}
-          />
-        ) : null}
-
-        {activeTab === "batting" ? (
-          <BattingTab
-            battingOrder={battingOrderPlayers}
-            gameFlow={gameFlow}
-            seasonStats={seasonStats}
-            onGenerate={regenerateBattingOrder}
+            onGenerateBattingOrder={regenerateBattingLineup}
+            onGeneratePositions={regenerateFullGamePlan}
+            onMarkUnavailable={markPlayerUnavailable}
+            onMoveBatter={moveBatter}
             onNextBatter={advanceBatter}
-            onOut={() => recordOut()}
-            onRun={() => recordRun("ours")}
-            onMove={moveBatter}
+            onPreviewInning={setFieldPreviewInning}
+            onRotationStyleChange={setRotationStyle}
+            onSave={saveGameToSeason}
           />
         ) : null}
 
@@ -1020,7 +1067,7 @@ export default function Home() {
             onAdd={addPlayer}
             onChange={updateRosterPlayer}
             onToggle={togglePosition}
-            onGenerate={regenerateFullGamePlan}
+            onGenerate={() => regenerateFullGamePlan()}
           />
         ) : null}
 
@@ -1060,9 +1107,8 @@ export default function Home() {
       </div>
 
       <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-[#d8d2c4] bg-[#fbfaf5]/95 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-2 backdrop-blur">
-        <div className="mx-auto grid max-w-5xl grid-cols-3 gap-1.5">
-          <TabButton active={activeTab === "field"} label="Field" onClick={() => setActiveTab("field")} />
-          <TabButton active={activeTab === "batting"} label="Bat" onClick={() => setActiveTab("batting")} />
+        <div className="mx-auto grid max-w-5xl grid-cols-2 gap-1.5">
+          <TabButton active={activeTab === "lineup"} label="Lineup" onClick={() => setActiveTab("lineup")} />
           <TabButton active={activeTab === "pitch"} label="Pitch" onClick={() => setActiveTab("pitch")} />
         </div>
       </nav>
@@ -1093,7 +1139,7 @@ function TodayTab({
       : eventStatus === "planned"
         ? "Plan game"
         : "Manage game";
-  const primaryTab: Tab = eventStatus === "planned" ? "roster" : "field";
+  const primaryTab: Tab = eventStatus === "planned" ? "roster" : "lineup";
 
   return (
     <section className="space-y-4">
@@ -1390,6 +1436,320 @@ function StatusPill({ value, wide = false }: { value: string; wide?: boolean }) 
   );
 }
 
+function LineupTab({
+  activeAssignment,
+  activeInning,
+  battingOrder,
+  compliance,
+  currentInning,
+  gameFlow,
+  innings,
+  pitchLog,
+  pitcherInnings,
+  pitcherQueue,
+  players,
+  rotationStyle,
+  onAssign,
+  onBench,
+  onFillOpenSpots,
+  onGenerateBattingOrder,
+  onGeneratePositions,
+  onMarkUnavailable,
+  onMoveBatter,
+  onNextBatter,
+  onPreviewInning,
+  onRotationStyleChange,
+  onSave,
+}: {
+  activeAssignment?: Assignment;
+  activeInning: number;
+  battingOrder: Player[];
+  compliance: string[];
+  currentInning: number;
+  gameFlow: GameFlow;
+  innings: Assignment[];
+  pitchLog: PitchLog;
+  pitcherInnings: Record<string, number[]>;
+  pitcherQueue: Player[];
+  players: Player[];
+  rotationStyle: RotationStyle;
+  onAssign: (inning: number, position: Position, playerId: string) => void;
+  onBench: (inning: number, playerId: string) => void;
+  onFillOpenSpots: (inning: number) => void;
+  onGenerateBattingOrder: () => void;
+  onGeneratePositions: (style?: RotationStyle) => void;
+  onMarkUnavailable: (playerId: string) => void;
+  onMoveBatter: (playerId: string, direction: -1 | 1) => void;
+  onNextBatter: () => void;
+  onPreviewInning: (inning: number) => void;
+  onRotationStyleChange: (style: RotationStyle) => void;
+  onSave: () => void;
+}) {
+  const [lineupView, setLineupView] = useState<"now" | "plan">("plan");
+  const [unavailablePlayerId, setUnavailablePlayerId] = useState("");
+  const currentBatter = battingOrder[gameFlow.currentBatterIndex % Math.max(1, battingOrder.length)];
+  const nextInning = Math.min(AAA_RULES.innings, currentInning + 1);
+  const currentAssignment = innings.find((assignment) => assignment.inning === currentInning) ?? activeAssignment;
+  const upcomingBatters = battingOrder
+    .slice(gameFlow.currentBatterIndex + 1)
+    .concat(battingOrder.slice(0, gameFlow.currentBatterIndex + 1))
+    .slice(0, 3);
+  const nextAssignment = innings.find((assignment) => assignment.inning === nextInning);
+
+  return (
+    <section className="space-y-3">
+      <div className="flex items-end justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="text-lg font-semibold">Lineup</h2>
+          <p className="truncate text-sm text-[#66716d]">
+            Up: {currentBatter?.name ?? "set lineup"} · {gameFlow.battersThisHalf}/{battingOrder.length || 1} batters
+          </p>
+        </div>
+        <div className="grid shrink-0 grid-cols-2 rounded-md border border-[#d8d2c4] bg-white p-1">
+          {(["now", "plan"] as const).map((view) => (
+            <button
+              key={view}
+              className={`h-9 rounded px-3 text-sm font-semibold ${
+                lineupView === view ? "bg-[#176a5f] text-white" : "text-[#66716d]"
+              }`}
+              onClick={() => {
+                setLineupView(view);
+                if (view === "now") onPreviewInning(currentInning);
+              }}
+            >
+              {view === "now" ? "Now" : "Plan"}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {lineupView === "now" ? (
+        <>
+          <div className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-md bg-[#fbfaf5] p-3">
+                <div className="text-xs font-bold uppercase tracking-[0.08em] text-[#66716d]">Up</div>
+                <div className="truncate text-2xl font-bold">{currentBatter?.name ?? "Set lineup"}</div>
+              </div>
+              <button className="rounded-md bg-[#176a5f] text-base font-bold text-white" onClick={onNextBatter}>
+                Batter +1
+              </button>
+            </div>
+            <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+              <div>
+                <div className="mb-1 text-xs font-bold uppercase tracking-[0.08em] text-[#66716d]">
+                  Next bats
+                </div>
+                <p className="truncate font-semibold">
+                  {upcomingBatters.map((player) => player.name).join(", ") || "Set lineup"}
+                </p>
+              </div>
+              <div>
+                <div className="mb-1 text-xs font-bold uppercase tracking-[0.08em] text-[#66716d]">
+                  Next bench
+                </div>
+                <p className="truncate font-semibold">
+                  {nextAssignment?.bench.map((player) => player.name).join(", ") || "None"}
+                </p>
+              </div>
+            </div>
+            <div className="mt-3 grid grid-cols-[1fr_auto] gap-2">
+              <select
+                className="h-11 min-w-0 rounded-md border border-[#d8d2c4] bg-white px-3 text-sm font-semibold"
+                value={unavailablePlayerId}
+                onChange={(event) => setUnavailablePlayerId(event.target.value)}
+              >
+                <option value="">Player unavailable...</option>
+                {players
+                  .filter((player) => player.present)
+                  .map((player) => (
+                    <option key={player.id} value={player.id}>
+                      {player.name}
+                    </option>
+                  ))}
+              </select>
+              <button
+                className="h-11 rounded-md border border-[#d8d2c4] bg-white px-3 text-sm font-semibold disabled:text-[#b6b0a4]"
+                disabled={!unavailablePlayerId}
+                onClick={() => {
+                  onMarkUnavailable(unavailablePlayerId);
+                  setUnavailablePlayerId("");
+                }}
+              >
+                Remove future
+              </button>
+            </div>
+          </div>
+
+          <GameTab
+            activeAssignment={currentAssignment}
+            activeInning={currentInning}
+            compliance={compliance}
+            currentInning={currentInning}
+            pitchLog={pitchLog}
+            pitcherInnings={pitcherInnings}
+            pitcherQueue={pitcherQueue}
+            players={players}
+            onAssign={onAssign}
+            onBench={onBench}
+            onFillOpenSpots={onFillOpenSpots}
+            onPreviewInning={onPreviewInning}
+            onSave={onSave}
+          />
+        </>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-2 rounded-lg border border-[#d8d2c4] bg-white p-2 shadow-sm sm:grid-cols-[1fr_auto_auto]">
+            <label className="col-span-2 min-w-0 sm:col-span-1">
+              <span className="mb-1 block text-xs font-bold uppercase tracking-[0.08em] text-[#66716d]">
+                Positions
+              </span>
+              <select
+                className="h-11 w-full rounded-md border border-[#d8d2c4] bg-white px-3 text-sm font-semibold"
+                value={rotationStyle}
+                onChange={(event) => onRotationStyleChange(event.target.value as RotationStyle)}
+              >
+                <option value="standard">Rotate each inning</option>
+                <option value="twoInningBlocks">Hold spots where possible</option>
+              </select>
+            </label>
+            <button
+              className="h-11 self-end rounded-md bg-[#176a5f] px-3 text-sm font-semibold text-white"
+              onClick={() => onGeneratePositions(rotationStyle)}
+            >
+              Generate positions
+            </button>
+            <button
+              className="h-11 self-end rounded-md border border-[#d8d2c4] bg-white px-3 text-sm font-semibold"
+              onClick={onGenerateBattingOrder}
+            >
+              Fair batting
+            </button>
+          </div>
+
+          <div className="overflow-x-auto rounded-lg border border-[#d8d2c4] bg-white shadow-sm">
+            <table className="min-w-[720px] w-full border-collapse text-sm">
+          <thead>
+            <tr className="border-b border-[#d8d2c4] bg-[#fbfaf5]">
+              <th className="sticky left-0 z-10 w-36 bg-[#fbfaf5] px-2 py-2 text-left text-xs font-bold uppercase tracking-[0.08em] text-[#66716d]">
+                Player
+              </th>
+              <th className="w-12 px-2 py-2 text-center text-xs font-bold uppercase tracking-[0.08em] text-[#66716d]">
+                Bat
+              </th>
+              {innings.map((assignment) => {
+                const isCurrent = assignment.inning === currentInning;
+                const isNext = assignment.inning === nextInning && !isCurrent;
+                const isSelected = assignment.inning === activeInning;
+                return (
+                  <th
+                    key={assignment.inning}
+                    className={`w-16 border-l border-[#e7e1d5] px-1 py-1 text-center ${
+                      isCurrent
+                        ? "bg-[#176a5f] text-white"
+                        : isNext
+                          ? "bg-[#e8f3f0] text-[#176a5f]"
+                          : isSelected
+                            ? "bg-[#fff8e9] text-[#9b3d2e]"
+                            : "text-[#66716d]"
+                    }`}
+                  >
+                    <button
+                      className="h-8 w-full rounded text-sm font-bold"
+                      onClick={() => onPreviewInning(assignment.inning)}
+                    >
+                      {assignment.inning}
+                    </button>
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {battingOrder.map((player, index) => (
+              <tr key={player.id} className="border-b border-[#eee8dc] last:border-0">
+                <th className="sticky left-0 z-10 bg-white px-2 py-2 text-left font-semibold">
+                  <span className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate">{player.name}</span>
+                    <span className="grid grid-cols-2 gap-1">
+                      <button
+                        className="h-7 w-8 rounded border border-[#d8d2c4] bg-[#fbfaf5] text-[11px] font-bold text-[#66716d] disabled:opacity-30"
+                        disabled={index === 0}
+                        onClick={() => onMoveBatter(player.id, -1)}
+                      >
+                        Up
+                      </button>
+                      <button
+                        className="h-7 w-8 rounded border border-[#d8d2c4] bg-[#fbfaf5] text-[11px] font-bold text-[#66716d] disabled:opacity-30"
+                        disabled={index === battingOrder.length - 1}
+                        onClick={() => onMoveBatter(player.id, 1)}
+                      >
+                        Dn
+                      </button>
+                    </span>
+                  </span>
+                </th>
+                <td className="px-2 py-2 text-center font-bold text-[#9b3d2e]">{index + 1}</td>
+                {innings.map((assignment) => {
+                  const value = positionForPlayer(assignment, player.id);
+                  const isCurrent = assignment.inning === currentInning;
+                  const isNext = assignment.inning === nextInning && !isCurrent;
+                  const isSelected = assignment.inning === activeInning;
+                  return (
+                    <td
+                      key={`${player.id}-${assignment.inning}`}
+                      className={`border-l border-[#eee8dc] px-1 py-1 text-center ${
+                        isCurrent
+                          ? "bg-[#e8f3f0]"
+                          : isNext
+                            ? "bg-[#f4faf8]"
+                            : isSelected
+                              ? "bg-[#fff8e9]"
+                              : ""
+                      }`}
+                    >
+                      <button
+                        className={`h-9 w-full rounded-md text-sm font-bold ${
+                          value === "B"
+                            ? "bg-[#fbfaf5] text-[#66716d]"
+                            : value === "-"
+                              ? "bg-[#fff1ed] text-[#9b3d2e]"
+                              : "bg-white text-[#17211f]"
+                        }`}
+                        onClick={() => onPreviewInning(assignment.inning)}
+                      >
+                        {value}
+                      </button>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+            </table>
+          </div>
+
+          <GameTab
+            activeAssignment={activeAssignment}
+            activeInning={activeInning}
+            compliance={compliance}
+            currentInning={currentInning}
+            pitchLog={pitchLog}
+            pitcherInnings={pitcherInnings}
+            pitcherQueue={pitcherQueue}
+            players={players}
+            onAssign={onAssign}
+            onBench={onBench}
+            onFillOpenSpots={onFillOpenSpots}
+            onPreviewInning={onPreviewInning}
+            onSave={onSave}
+          />
+        </>
+      )}
+    </section>
+  );
+}
+
 function GameTab({
   activeAssignment,
   activeInning,
@@ -1596,121 +1956,6 @@ function PositionRow({
         {requested ? <span className="mt-0.5 block text-xs font-semibold text-[#176a5f]">requested</span> : null}
       </span>
     </label>
-  );
-}
-
-function BattingTab({
-  battingOrder,
-  gameFlow,
-  seasonStats,
-  onGenerate,
-  onNextBatter,
-  onOut,
-  onRun,
-  onMove,
-}: {
-  battingOrder: Player[];
-  gameFlow: GameFlow;
-  seasonStats: SeasonStats;
-  onGenerate: () => void;
-  onNextBatter: () => void;
-  onOut: () => void;
-  onRun: () => void;
-  onMove: (playerId: string, direction: -1 | 1) => void;
-}) {
-  const bottomThirdStart = Math.floor((Math.max(battingOrder.length, 1) * 2) / 3) + 1;
-  const currentBatter = battingOrder[gameFlow.currentBatterIndex % Math.max(1, battingOrder.length)];
-
-  return (
-    <section className="space-y-4">
-      <div className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <h2 className="text-lg font-semibold">Batting Lineup</h2>
-            <p className="text-sm text-[#66716d]">
-              Current batter: {currentBatter?.name ?? "Set lineup"}
-            </p>
-          </div>
-          <button
-            className="h-11 rounded-md bg-[#176a5f] px-4 text-sm font-semibold text-white"
-            onClick={onGenerate}
-          >
-            Fair order
-          </button>
-        </div>
-      </div>
-
-      <div className="rounded-lg border border-[#d8d2c4] bg-white p-3 shadow-sm">
-        <div className="grid grid-cols-3 gap-2">
-          <button className="h-12 rounded-md bg-[#176a5f] text-sm font-bold text-white" onClick={onRun}>
-            Run +1
-          </button>
-          <button className="h-12 rounded-md bg-[#176a5f] text-sm font-bold text-white" onClick={onOut}>
-            Out +1
-          </button>
-          <button className="h-12 rounded-md border border-[#d8d2c4] text-sm font-semibold" onClick={onNextBatter}>
-            Next Batter
-          </button>
-        </div>
-        <p className="mt-2 text-sm text-[#66716d]">
-          Batters this half: {gameFlow.battersThisHalf}/{battingOrder.length || 1}
-        </p>
-      </div>
-
-      <div className="space-y-2">
-        {battingOrder.map((player, index) => {
-          const stats = seasonStats[player.id] ?? emptyStats();
-          const battingGames = stats.battingGames ?? 0;
-          const averageSlot = battingGames
-            ? ((stats.battingOrderTotal ?? 0) / battingGames).toFixed(1)
-            : "new";
-          const isBottomThird = index + 1 >= bottomThirdStart;
-
-          return (
-            <div
-              key={player.id}
-              className={`rounded-lg border bg-white p-3 shadow-sm ${
-                isBottomThird ? "border-[#e6c08b]" : "border-[#d8d2c4]"
-              }`}
-            >
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex min-w-0 items-center gap-3">
-                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-[#fbfaf5] font-bold text-[#9b3d2e]">
-                    {index + 1}
-                  </span>
-                  <div className="min-w-0">
-                    <div className="truncate font-semibold">
-                      {player.name}
-                      {currentBatter?.id === player.id ? " · up" : ""}
-                    </div>
-                    <div className="text-xs text-[#66716d]">
-                      Avg slot {averageSlot}
-                      {stats.bottomThirdGames ? ` · ${stats.bottomThirdGames} bottom-third` : ""}
-                    </div>
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-1.5">
-                  <button
-                    className="h-10 w-12 rounded-md border border-[#d8d2c4] text-sm font-semibold disabled:text-[#b6b0a4]"
-                    disabled={index === 0}
-                    onClick={() => onMove(player.id, -1)}
-                  >
-                    Up
-                  </button>
-                  <button
-                    className="h-10 w-14 rounded-md border border-[#d8d2c4] text-sm font-semibold disabled:text-[#b6b0a4]"
-                    disabled={index === battingOrder.length - 1}
-                    onClick={() => onMove(player.id, 1)}
-                  >
-                    Down
-                  </button>
-                </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </section>
   );
 }
 
@@ -2361,7 +2606,7 @@ function ScheduleSection({
                 ? "season"
                 : status === "planned"
                   ? "roster"
-                  : "field";
+                  : "lineup";
 
             return (
               <div
@@ -2845,6 +3090,20 @@ function getPitcherInnings(assignments: Assignment[]) {
   }, {});
 }
 
+function positionForPlayer(assignment: Assignment, playerId: string) {
+  if (assignment.bench.some((player) => player.id === playerId)) return "B";
+  const entry = Object.entries(assignment.positions).find(([, player]) => player.id === playerId);
+  return entry?.[0] ?? "-";
+}
+
+function normalizeBattingOrder(order: string[], players: Player[]) {
+  const present = players.filter((player) => player.present);
+  const presentIds = new Set(present.map((player) => player.id));
+  const ordered = order.filter((id) => presentIds.has(id));
+  const missing = present.filter((player) => !ordered.includes(player.id)).map((player) => player.id);
+  return [...ordered, ...missing];
+}
+
 function emptyStats(): PlayerSeasonStats {
   return {
     fieldInnings: 0,
@@ -2857,16 +3116,6 @@ function emptyStats(): PlayerSeasonStats {
     bottomThirdGames: 0,
     positions: {},
   };
-}
-
-function normalizeBattingOrder(players: Player[], order: string[]) {
-  const presentPlayers = players.filter((player) => player.present);
-  const presentIds = new Set(presentPlayers.map((player) => player.id));
-  const existing = order.filter((id) => presentIds.has(id));
-  const missing = presentPlayers
-    .filter((player) => !existing.includes(player.id))
-    .map((player) => player.id);
-  return [...existing, ...missing];
 }
 
 function MiniStat({ label, value }: { label: string; value: string }) {
